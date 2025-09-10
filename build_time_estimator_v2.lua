@@ -27,14 +27,21 @@ Features:
 • Real-time calculation based on available builders and nano turrets
 • Economy-aware predictions accounting for metal/energy constraints  
 • Works in both player and spectator modes
-• Hold backtick (`) to see only idle builders
+• Press backtick (`) to toggle IDLE BUILDER MODE:
+  - Shows idle builders AND turrets in range
+  - Auto-commands idle units to GUARD selected builder
+  - Units help build whatever the builder is constructing
+  - Works with T1/T2 compatibility (guard copies commands)
+  - 2-second cooldown per unit to prevent spam
+  - Gray color scheme in idle mode
+  - Press again to turn off
 • Hover over units under construction to see completion time
 • Color-coded indicators for economy status (green/yellow/red)
 • Shows builder count, resource usage rates, and storage levels
 • Automatically detects builders in range and selected builders
 ]],
-        author = "Pyrem",
-        version = "2.0.1",
+        author = "Pyrem, enhanced by Waleed",
+        version = "2.6.0",
         date = "2024",
         license = "GNU GPL, v2 or later",
         layer = -999,
@@ -96,6 +103,26 @@ local BACKTICK_KEY_2 = 192  -- SDL backtick/tilde key
 -- Import required modules
 local gl = gl
 local CMD = CMD
+
+-- Command IDs for clarity
+local CMD_MOVE = CMD.MOVE
+local CMD_PATROL = CMD.PATROL
+local CMD_FIGHT = CMD.FIGHT
+local CMD_GUARD = CMD.GUARD
+local CMD_REPAIR = CMD.REPAIR
+local CMD_RECLAIM = CMD.RECLAIM
+local CMD_RESURRECT = CMD.RESURRECT
+local CMD_WAIT = CMD.WAIT
+local CMD_STOP = CMD.STOP
+
+-- 🎯 Idle builder auto-command system
+local idleBuildersCommanded = {}  -- Track cooldown per builder {[unitID] = frameExpiry}
+local lastCommandFeedback = ""
+local commandFeedbackTime = 0
+local COMMAND_COOLDOWN = 60  -- 2 seconds at 30fps
+local FEEDBACK_DURATION = 60  -- Show feedback for 2 seconds
+local cachedIdleBuilders = {}  -- Cache idle builders for command system
+local cachedIdleTurrets = {}  -- Cache idle turrets separately
 
 -- BAR-style color constants
 local ECO_GREEN = "\255\120\235\120"  -- Positive/affordable
@@ -169,10 +196,154 @@ local function formatNumber(num)
     end
 end
 
--- Helper function to check if a builder is idle
+-- Helper function to check if a MOBILE builder is idle
+-- Mobile builders: Building or actively working = busy, GUARD alone = idle
 local function isBuilderIdle(unitID)
+    -- MOST IMPORTANT: Check if actively building something
+    local buildingID = Spring.GetUnitIsBuilding(unitID)
+    if buildingID then
+        return false  -- Actively building = NOT idle
+    end
+    
+    -- Check if unit is moving (velocity check - mobile builders only)
+    local vx, vy, vz = Spring.GetUnitVelocity(unitID)
+    if vx and (math.abs(vx) > 0.01 or math.abs(vz) > 0.01) then
+        return false  -- Moving = NOT idle
+    end
+    
+    -- No commands = definitely idle
     local commands = Spring.GetUnitCommands(unitID, 1)
-    return not commands or #commands == 0
+    if not commands or #commands == 0 then
+        return true  -- No commands = IDLE
+    end
+    
+    -- Has commands - check if it's ONLY guard (guard alone = idle)
+    if #commands == 1 and commands[1].id == CMD_GUARD then
+        return true  -- Only guarding, not building = IDLE
+    end
+    
+    -- Has other commands = busy
+    return false
+end
+
+-- Helper function to check if unit is guarding any selected builder
+local function isGuardingSelectedBuilder(unitID, selectedBuilders)
+    if not selectedBuilders or not next(selectedBuilders) then
+        return false, nil
+    end
+    
+    local commands = Spring.GetUnitCommands(unitID, 5)
+    if commands then
+        for _, cmd in ipairs(commands) do
+            if cmd.id == CMD_GUARD and cmd.params and cmd.params[1] then
+                local targetID = cmd.params[1]
+                if selectedBuilders[targetID] then
+                    return true, targetID  -- Guarding a selected builder
+                end
+            end
+        end
+    end
+    return false, nil
+end
+
+-- 🔨 Command idle builders and turrets to guard selected builders
+local function commandIdleUnitsToGuard()
+    if not showIdleOnly then return 0 end  -- Only work in idle mode
+    
+    local currentFrame = Spring.GetGameFrame()
+    local commandedCount = 0
+    local turretCount = 0
+    local skippedCooldown = 0
+    
+    -- Get selected units that are builders (these will be doing the actual building)
+    local selectedUnits = Spring.GetSelectedUnits()
+    if not selectedUnits or #selectedUnits == 0 then
+        -- No selected units to guard
+        return 0
+    end
+    
+    -- Find the first selected builder to guard
+    local targetBuilder = nil
+    for _, unitID in ipairs(selectedUnits) do
+        local unitDefID = Spring.GetUnitDefID(unitID)
+        if unitDefID and UnitDefs[unitDefID].isBuilder and not UnitDefs[unitDefID].isFactory then
+            targetBuilder = unitID
+            break
+        end
+    end
+    
+    if not targetBuilder then
+        -- No selected builder to guard
+        return 0
+    end
+    
+    -- Found target builder to guard
+    
+    -- Command idle mobile builders to guard (only those in range)
+    if cachedIdleBuilders and #cachedIdleBuilders > 0 then
+        for _, builder in ipairs(cachedIdleBuilders) do
+            if builder.idle and builder.inRange then  -- Only command idle builders in range
+                -- Check cooldown
+                local cooldownExpiry = idleBuildersCommanded[builder.id]
+                if not cooldownExpiry or currentFrame > cooldownExpiry then
+                    -- Issue guard command
+                    Spring.GiveOrderToUnit(builder.id, CMD_GUARD, {targetBuilder}, {})
+                    
+                    -- Track cooldown
+                    idleBuildersCommanded[builder.id] = currentFrame + COMMAND_COOLDOWN
+                    commandedCount = commandedCount + 1
+                else
+                    skippedCooldown = skippedCooldown + 1
+                end
+            end
+        end
+    end
+    
+    -- Command idle turrets to guard (only those in range)
+    if cachedIdleTurrets and #cachedIdleTurrets > 0 then
+        for _, turret in ipairs(cachedIdleTurrets) do
+            if turret.idle and turret.inRange then  -- Turrets must be in range
+                -- Check cooldown
+                local cooldownExpiry = idleBuildersCommanded[turret.id]
+                if not cooldownExpiry or currentFrame > cooldownExpiry then
+                    -- Issue guard command
+                    Spring.GiveOrderToUnit(turret.id, CMD_GUARD, {targetBuilder}, {})
+                    
+                    -- Track cooldown  
+                    idleBuildersCommanded[turret.id] = currentFrame + COMMAND_COOLDOWN
+                    turretCount = turretCount + 1
+                else
+                    skippedCooldown = skippedCooldown + 1
+                end
+            end
+        end
+    end
+    
+    -- Clean up expired cooldowns
+    for unitID, expiry in pairs(idleBuildersCommanded) do
+        if currentFrame > expiry then
+            idleBuildersCommanded[unitID] = nil
+        end
+    end
+    
+    -- Set feedback message
+    local totalCommanded = commandedCount + turretCount
+    if totalCommanded > 0 then
+        local parts = {}
+        if commandedCount > 0 then
+            table.insert(parts, commandedCount .. " builders")
+        end
+        if turretCount > 0 then
+            table.insert(parts, turretCount .. " turrets")
+        end
+        lastCommandFeedback = "✓ Commanded " .. table.concat(parts, " and ") .. " to guard"
+        commandFeedbackTime = currentFrame + FEEDBACK_DURATION
+    elseif skippedCooldown > 0 then
+        lastCommandFeedback = "⏳ " .. skippedCooldown .. " units on cooldown"
+        commandFeedbackTime = currentFrame + FEEDBACK_DURATION
+    end
+    
+    return totalCommanded
 end
 
 -- Nano turret definitions
@@ -186,17 +357,33 @@ local TURRET_NAMES = {
 -- Convert names to UnitDefIDs for fast lookup
 local TURRET_DEF_IDS = {}
 
--- Helper function to check if a nano turret is idle
+-- Helper function to check if a NANO TURRET is idle
+-- Turrets: Building or actively working = busy, GUARD/FIGHT alone = idle
 local function isTurretIdle(unitID)
-    local commands = Spring.GetUnitCommands(unitID, 2)
-    if not commands or #commands == 0 then
-        return true
+    -- MOST IMPORTANT: Check if actively building/repairing something
+    local buildingID = Spring.GetUnitIsBuilding(unitID)
+    if buildingID then
+        return false  -- Actively building = NOT idle
     end
-    -- Turret is idle if it only has FIGHT command (default guard mode)
-    if #commands == 1 and commands[1].id == CMD.FIGHT then
-        return true
+    
+    -- Check commands but IGNORE state commands AND guard
+    local commands = Spring.GetUnitCommands(unitID, 5)
+    if commands and #commands > 0 then
+        -- Check if turret has REAL work commands (NOT including GUARD)
+        for _, cmd in ipairs(commands) do
+            -- These are actual work commands for turrets
+            if cmd.id == CMD_REPAIR or 
+               cmd.id == CMD_RECLAIM or
+               cmd.id == CMD_RESURRECT or
+               cmd.id < 0 then  -- Negative = build commands
+                return false  -- Has real work = NOT idle
+            end
+            -- GUARD, FIGHT, STOP, WAIT are NOT real work - ignore them
+        end
     end
-    return false
+    
+    -- Not building, no real work commands (guard is OK) = IDLE
+    return true
 end
 
 -- Get real-time economy data
@@ -530,19 +717,37 @@ function widget:PlayerChanged(playerID)
     Spring.Echo("Build Timer v2: Player changed, now in " .. modeText .. " tracking " .. (cachedResults.playerName or "unknown player"))
 end
 
--- Key handlers for idle builder toggle
+-- Key handler for idle builder toggle (press to toggle on/off)
 function widget:KeyPress(key, mods, isRepeat)
     if (key == BACKTICK_KEY_1 or key == BACKTICK_KEY_2) and not isRepeat then
-        showIdleOnly = true
+        showIdleOnly = not showIdleOnly  -- Toggle the state
+        
+        -- Clear cached idle units when turning off
+        if not showIdleOnly then
+            cachedIdleBuilders = {}
+            cachedIdleTurrets = {}
+        end
+        
         return false
     end
 end
 
-function widget:KeyRelease(key, mods)
-    if key == BACKTICK_KEY_1 or key == BACKTICK_KEY_2 then
-        showIdleOnly = false
+-- 🎯 Intercept build commands to auto-command idle builders
+function widget:CommandNotify(cmdID, cmdParams, cmdOptions)
+    -- Check if placing a building (negative cmdID) and idle mode is active
+    if showIdleOnly and cmdID < 0 then
+        local buildDefID = -cmdID  -- Convert to positive unit def ID
+        local unitDef = UnitDefs[buildDefID]
+        local unitName = unitDef and unitDef.name or "unknown"
+        
+        -- Command idle units to guard the selected builder
+        local commanded = commandIdleUnitsToGuard()
+        
+        -- Still let the original command through for any selected builders
         return false
     end
+    
+    return false  -- Don't block the command
 end
 
 -- Optimized calculation loop with player-specific filtering
@@ -603,7 +808,7 @@ function widget:GameFrame()
     -- Check player's builders against placement position
     for _, unitID in ipairs(playerUnits) do
         local unitDefID = Spring.GetUnitDefID(unitID)
-        -- Only count as builder if it's a builder but NOT a nano turret
+        -- Count mobile builders (not nano turrets, not factories)
         if unitDefID and UnitDefs[unitDefID].isBuilder and not UnitDefs[unitDefID].isFactory and not TURRET_DEF_IDS[unitDefID] then
             local bx, by, bz = Spring.GetUnitPosition(unitID)
             if bx then
@@ -614,8 +819,12 @@ function widget:GameFrame()
                 local isSelected = selectedBuilders[unitID] or false
                 local inRange = distance <= buildRange
                 
-                -- Add builder if in range OR selected
-                if inRange or isSelected then
+                -- Check if guarding a selected builder
+                local isGuarding, guardTarget = isGuardingSelectedBuilder(unitID, selectedBuilders)
+                
+                -- Add builder if in range OR selected OR guarding selected
+                if inRange or isSelected or isGuarding then
+                    -- Check if builder is idle (includes guard without building)
                     local idle = isBuilderIdle(unitID)
                     
                     -- Only add builder if showing all OR it's idle (when showing idle only)
@@ -627,7 +836,9 @@ function widget:GameFrame()
                             selected = isSelected,
                             distance = distance,
                             buildRange = buildRange,
-                            idle = idle
+                            idle = idle,
+                            guarding = isGuarding,
+                            guardTarget = guardTarget
                         }
                     end
                 end
@@ -635,12 +846,16 @@ function widget:GameFrame()
         end
     end
     
-    -- Calculate totals
+    -- Calculate totals and count guarding units
     local builderCount = #builders
+    local guardingBuilderCount = 0
     local totalBuildPower = 0
     
     for _, builder in ipairs(builders) do
         totalBuildPower = totalBuildPower + builder.buildSpeed
+        if builder.guarding and not builder.selected then
+            guardingBuilderCount = guardingBuilderCount + 1
+        end
     end
     
     -- Check nano turrets in range from player's units
@@ -655,7 +870,11 @@ function widget:GameFrame()
                 
                 local inRange = distance <= buildRange
                 
-                if inRange then
+                -- Check if turret is guarding a selected builder
+                local isGuarding, guardTarget = isGuardingSelectedBuilder(unitID, selectedBuilders)
+                
+                -- Include turret if in range OR guarding selected builder
+                if inRange or isGuarding then
                     local idle = isTurretIdle(unitID)
                     local buildSpeed = UnitDefs[unitDefID].buildSpeed or 100
                     
@@ -665,7 +884,9 @@ function widget:GameFrame()
                             id = unitID,
                             buildSpeed = buildSpeed,
                             inRange = inRange,
-                            idle = idle
+                            idle = idle,
+                            guarding = isGuarding,
+                            guardTarget = guardTarget
                         }
                         totalBuildPower = totalBuildPower + buildSpeed
                     end
@@ -674,7 +895,26 @@ function widget:GameFrame()
         end
     end
     
+    -- 📦 Cache idle builders and turrets for command system (when in idle mode)
+    if showIdleOnly then
+        cachedIdleBuilders = builders  -- Store the filtered builder list
+        cachedIdleTurrets = turrets  -- Store the filtered turret list
+        local totalIdle = #builders + #turrets
+        -- Cached idle units for command system
+    else
+        cachedIdleBuilders = {}  -- Clear when not in idle mode
+        cachedIdleTurrets = {}  -- Clear when not in idle mode
+    end
+    
     local turretCount = #turrets
+    local guardingTurretCount = 0
+    
+    -- Count guarding turrets
+    for _, turret in ipairs(turrets) do
+        if turret.guarding then
+            guardingTurretCount = guardingTurretCount + 1
+        end
+    end
     
     -- Calculate resource consumption rates
     local metalCost = unitDef.metalCost or 0
@@ -709,11 +949,20 @@ function widget:GameFrame()
         cachedResults.timeText = timeText
         cachedResults.builderCount = builderCount
         cachedResults.turretCount = turretCount
+        cachedResults.guardingBuilderCount = guardingBuilderCount
+        cachedResults.guardingTurretCount = guardingTurretCount
         cachedResults.showingIdle = showIdleOnly
         cachedResults.ecoStatus = ecoStatus
         cachedResults.metalPerSecond = metalPerSecond
         cachedResults.energyPerSecond = energyPerSecond
     end
+    
+    -- 🌐 Share data with other widgets via WG table
+    WG.BuildTimeEstimator = WG.BuildTimeEstimator or {}
+    WG.BuildTimeEstimator.showingIdleOnly = showIdleOnly
+    WG.BuildTimeEstimator.idleBuilders = cachedIdleBuilders
+    WG.BuildTimeEstimator.builderCount = cachedResults.builderCount
+    WG.BuildTimeEstimator.turretCount = cachedResults.turretCount
 end
 
 function widget:DrawScreen()
@@ -830,15 +1079,23 @@ function widget:DrawScreen()
                     font:Begin()
                     font:SetOutlineColor(0, 0, 0, 1)
                     
-                    -- Timer color based on economy
+                    -- Timer color based on economy (gray in idle mode)
                     local timerColor = ECO_WHITE
-                    if not ecoStatus.canAfford then
+                    if cachedResults.showingIdle then
+                        timerColor = ECO_GRAY  -- Always gray in idle mode
+                    elseif not ecoStatus.canAfford then
                         timerColor = ECO_RED
                     elseif ecoStatus.metalPercent < 100 or ecoStatus.energyPercent < 100 then
                         timerColor = ECO_YELLOW
                     end
                     
-                    font:Print(timerColor .. "⏱️ " .. cachedResults.timeText, screenX, screenY, 24, "co")
+                    -- Show idle mode indicator
+                    if cachedResults.showingIdle then
+                        font:Print(ECO_GRAY .. "🎯 IDLE BUILDER MODE", screenX, screenY - 25, 16, "co")
+                        font:Print(timerColor .. "⏱️ " .. cachedResults.timeText, screenX, screenY, 24, "co")
+                    else
+                        font:Print(timerColor .. "⏱️ " .. cachedResults.timeText, screenX, screenY, 24, "co")
+                    end
                     
                     -- Show player name in spectator mode
                     if isSpectator and cachedResults.playerName then
@@ -849,39 +1106,52 @@ function widget:DrawScreen()
                     local builderText = ""
                     
                     if cachedResults.showingIdle then
-                        local parts = {}
+                        local idleParts = {}
                         if cachedResults.builderCount > 0 then
-                            table.insert(parts, cachedResults.builderCount .. " builders")
+                            table.insert(idleParts, cachedResults.builderCount .. " builders")
                         end
                         if cachedResults.turretCount > 0 then
-                            table.insert(parts, cachedResults.turretCount .. " turrets")
+                            table.insert(idleParts, cachedResults.turretCount .. " turrets")
                         end
-                        builderText = "Idle • (" .. table.concat(parts, ", ") .. ")"
+                        
+                        if #idleParts > 0 then
+                            builderText = "Ready: " .. table.concat(idleParts, " + ") .. " idle"
+                        else
+                            builderText = "No idle builders or turrets in range"
+                        end
                     else
                         local parts = {}
                         if cachedResults.builderCount > 0 then
-                            table.insert(parts, cachedResults.builderCount .. " builders")
+                            local builderStr = cachedResults.builderCount .. " builders"
+                            if cachedResults.guardingBuilderCount and cachedResults.guardingBuilderCount > 0 then
+                                builderStr = builderStr .. " [" .. cachedResults.guardingBuilderCount .. " guarding]"
+                            end
+                            table.insert(parts, builderStr)
                         end
                         if cachedResults.turretCount > 0 then
-                            table.insert(parts, cachedResults.turretCount .. " turrets")
+                            local turretStr = cachedResults.turretCount .. " turrets"
+                            if cachedResults.guardingTurretCount and cachedResults.guardingTurretCount > 0 then
+                                turretStr = turretStr .. " [" .. cachedResults.guardingTurretCount .. " guarding]"
+                            end
+                            table.insert(parts, turretStr)
                         end
                         builderText = "(" .. table.concat(parts, ", ") .. ")"
                     end
                     
-                    local yOffset = isSpectator and -35 or -20  -- Adjust for player name
+                    local yOffset = cachedResults.showingIdle and -45 or (isSpectator and -35 or -20)
                     font:Print(ECO_GRAY .. builderText, screenX, screenY + yOffset, 14, "co")
                     
                     -- Usage rates
-                    yOffset = isSpectator and -50 or -35
+                    yOffset = cachedResults.showingIdle and -60 or (isSpectator and -50 or -35)
                     font:Print(ECO_GRAY .. "Usage • " .. formatNumber(cachedResults.metalPerSecond) .. " M/s • " .. 
                               formatNumber(cachedResults.energyPerSecond) .. " E/s", 
                               screenX, screenY + yOffset, 12, "co")
                     
-                    -- Storage availability
-                    local metalStorageColor = ecoStatus.hasMetalStorage and ECO_GREEN or ECO_RED
-                    local energyStorageColor = ecoStatus.hasEnergyStorage and ECO_GREEN or ECO_RED
+                    -- Storage availability (gray in idle mode)
+                    local metalStorageColor = cachedResults.showingIdle and ECO_GRAY or (ecoStatus.hasMetalStorage and ECO_GREEN or ECO_RED)
+                    local energyStorageColor = cachedResults.showingIdle and ECO_GRAY or (ecoStatus.hasEnergyStorage and ECO_GREEN or ECO_RED)
                     
-                    yOffset = isSpectator and -65 or -50
+                    yOffset = cachedResults.showingIdle and -75 or (isSpectator and -65 or -50)
                     font:Print(ECO_GRAY .. "Storage " ..
                               metalStorageColor .. "• " .. formatNumber(ecoStatus.metalStored) .. " M " ..
                               energyStorageColor .. "• " .. formatNumber(ecoStatus.energyStored) .. " E",
@@ -905,8 +1175,14 @@ function widget:DrawScreen()
                             if hasProduction then productionText = productionText .. " " end
                             productionText = productionText .. string.format("• %.0f/%.0f E/s", energyProduction, energyRequired)
                         end
-                        yOffset = isSpectator and -80 or -65
-                        font:Print(ECO_GRAY .. "Production " .. ECO_RED .. productionText, screenX, screenY + yOffset, 12, "co")
+                        yOffset = cachedResults.showingIdle and -90 or (isSpectator and -80 or -65)
+                        font:Print(ECO_GRAY .. "Production " .. (cachedResults.showingIdle and ECO_GRAY or ECO_RED) .. productionText, screenX, screenY + yOffset, 12, "co")
+                    end
+                    
+                    -- 🎯 Command feedback
+                    local currentFrame = Spring.GetGameFrame()
+                    if commandFeedbackTime > currentFrame then
+                        font:Print(ECO_GRAY .. lastCommandFeedback, screenX, screenY - 95, 12, "co")
                     end
                     
                     font:End()
@@ -932,21 +1208,34 @@ function widget:DrawScreen()
                     local builderText = ""
                     
                     if cachedResults.showingIdle then
-                        local parts = {}
+                        local idleParts = {}
                         if cachedResults.builderCount > 0 then
-                            table.insert(parts, cachedResults.builderCount .. " builders")
+                            table.insert(idleParts, cachedResults.builderCount .. " builders")
                         end
                         if cachedResults.turretCount > 0 then
-                            table.insert(parts, cachedResults.turretCount .. " turrets")
+                            table.insert(idleParts, cachedResults.turretCount .. " turrets")
                         end
-                        builderText = "Idle • (" .. table.concat(parts, ", ") .. ")"
+                        
+                        if #idleParts > 0 then
+                            builderText = "Ready: " .. table.concat(idleParts, " + ") .. " idle"
+                        else
+                            builderText = "No idle builders or turrets in range"
+                        end
                     else
                         local parts = {}
                         if cachedResults.builderCount > 0 then
-                            table.insert(parts, cachedResults.builderCount .. " builders")
+                            local builderStr = cachedResults.builderCount .. " builders"
+                            if cachedResults.guardingBuilderCount and cachedResults.guardingBuilderCount > 0 then
+                                builderStr = builderStr .. " [" .. cachedResults.guardingBuilderCount .. " guarding]"
+                            end
+                            table.insert(parts, builderStr)
                         end
                         if cachedResults.turretCount > 0 then
-                            table.insert(parts, cachedResults.turretCount .. " turrets")
+                            local turretStr = cachedResults.turretCount .. " turrets"
+                            if cachedResults.guardingTurretCount and cachedResults.guardingTurretCount > 0 then
+                                turretStr = turretStr .. " [" .. cachedResults.guardingTurretCount .. " guarding]"
+                            end
+                            table.insert(parts, turretStr)
                         end
                         builderText = "(" .. table.concat(parts, ", ") .. ")"
                     end
