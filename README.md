@@ -127,7 +127,7 @@ Contributions are welcome! Please feel free to submit a Pull Request. For major 
 
 ## 📝 Changelog
 
-### Version 2.0 (2024)
+### Version 2.0 (Sept 10 - 2025)
 - Added spectator mode support
 - Implemented economy-aware predictions
 - Added nano turret detection
@@ -136,7 +136,7 @@ Contributions are welcome! Please feel free to submit a Pull Request. For major 
 - Color-coded economy indicators
 - Idle builder filtering with backtick key
 
-### Version 1.0 (2024)
+### Version 1.0 (Sept 7 - 2025)
 - Initial release
 - Basic build time calculation
 - Builder detection
