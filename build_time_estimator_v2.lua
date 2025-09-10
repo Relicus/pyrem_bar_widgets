@@ -1,7 +1,7 @@
 --------------------------------------------------------------------------------
 -- Build Time Estimator v2 Widget for Beyond All Reason
 --------------------------------------------------------------------------------
--- Copyright (C) 2024 Pyrem
+-- Copyright (C) 2025 Pyrem
 --
 -- This program is free software; you can redistribute it and/or modify
 -- it under the terms of the GNU General Public License as published by
