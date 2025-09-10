@@ -1,7 +1,7 @@
 --------------------------------------------------------------------------------
 -- Build Time Estimator v2 Widget for Beyond All Reason
 --------------------------------------------------------------------------------
--- Copyright (C) 2025 Pyrem
+-- Copyright (C) 2024 Pyrem
 --
 -- This program is free software; you can redistribute it and/or modify
 -- it under the terms of the GNU General Public License as published by
@@ -34,7 +34,7 @@ Features:
 • Automatically detects builders in range and selected builders
 ]],
         author = "Pyrem",
-        version = "2.0",
+        version = "2.0.1",
         date = "2024",
         license = "GNU GPL, v2 or later",
         layer = -999,
@@ -130,10 +130,15 @@ local function updatePlayerInfo()
 end
 
 -- 🎯 Get units belonging to specific player/team
-local function getPlayerUnits()
+local function getPlayerUnits(forceRefresh)
     if not targetTeamID then return {} end
     
-    -- Use cached units if available and recent
+    -- For critical calculations, always get fresh data
+    if forceRefresh then
+        return Spring.GetTeamUnits(targetTeamID) or {}
+    end
+    
+    -- Use cached units only for non-critical operations
     local currentFrame = Spring.GetGameFrame()
     if unitCache.units and unitCache.teamID == targetTeamID and 
        (currentFrame - lastCacheUpdate) < CACHE_UPDATE_FREQUENCY then
@@ -296,7 +301,7 @@ local function calculateConstructionInfo(unitID, buildProgress)
     
     -- Find builders working on this unit (only from our target player)
     local totalBuildPower = 0
-    local playerUnits = getPlayerUnits()
+    local playerUnits = getPlayerUnits(true)  -- Force refresh for accurate calculations
     
     for _, builderID in ipairs(playerUnits) do
         local builderDefID = Spring.GetUnitDefID(builderID)
@@ -576,8 +581,8 @@ function widget:GameFrame()
         return
     end
     
-    -- Get player-specific units instead of all team units
-    local playerUnits = getPlayerUnits()
+    -- Get player-specific units - ALWAYS FRESH for accurate range detection
+    local playerUnits = getPlayerUnits(true)  -- Force refresh for accurate calculations
     if not playerUnits or #playerUnits == 0 then
         return
     end
