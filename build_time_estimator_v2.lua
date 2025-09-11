@@ -27,22 +27,58 @@ Features:
 • Real-time calculation based on available builders and nano turrets
 • Economy-aware predictions accounting for metal/energy constraints  
 • Works in both player and spectator modes
-• Press backtick (`) to toggle IDLE BUILDER MODE:
-  - Shows idle builders AND turrets in range
-  - Auto-commands idle units to GUARD selected builder
-  - Units help build whatever the builder is constructing
-  - Works with T1/T2 compatibility (guard copies commands)
-  - 2-second cooldown per unit to prevent spam
+• Includes units guarding selected builders in calculations
+• Smart idle detection - units with GUARD command but not building are idle
+
+🎯 IDLE BUILDER MODE - Press backtick (`) to toggle:
+  - Shows ALL idle builders AND turrets (in range or guarding)
+  - Auto-commands idle units to GUARD selected builder when placing buildings
+  - Idle = not actively building (GUARD alone doesn't make unit busy)
+  - Works with T1/T2 compatibility (guard copies valid commands)
+  - 2-second cooldown per unit to prevent command spam
   - Gray color scheme in idle mode
-  - Press again to turn off
+  - Command feedback shows units commanded
+
+v2.7.3 (2025):
+  - REFINED: Cleaner resource display with improved information hierarchy
+    • Shows both usage rates (M/s, E/s) AND total costs (M, E)
+    • Removed redundant production constraint display
+    • BP/s font size adjusted to 16 for better visual balance
+    • Usage rates shown above remaining/required resources
+  
+v2.7.2 (2025):
+  - IMPROVED: Better readability with adjusted fonts and spacing
+    • BP/s at size 16, other info at size 14 (was 12)
+    • Proper spacing between lines (no overlap)
+    • Clean, readable display
+  
+v2.7.1 (2025):
+  - FIXED: Hover-switched teams now persist permanently (no auto-reset)
+  - Selecting units clears hover lock and switches to selected team
+  - Visual feedback shows pending hover switch with progress percentage
+  
+v2.7.0 (2025):
+  - FIXED: Spectator mode now properly tracks selected player's units
+  - Auto-switches to show build power of selected units' team
+  - Shows correct BP/s, usage rates, and build times for each player
+  - NEW: Hover over any unit for 1 second to auto-switch to their team (spectator only)
+
+📊 Display Information:
 • Hover over units under construction to see completion time
-• Color-coded indicators for economy status (green/yellow/red)
-• Shows builder count, resource usage rates, and storage levels
-• Automatically detects builders in range and selected builders
+• Color-coded indicators: Green (affordable), Yellow (60-99%), Red (stalled)
+• Shows builder/turret counts with [X guarding] indicators
+• Displays usage rates (M/s, E/s) AND remaining/required resources (M, E)
+• Shows current storage levels for metal and energy
+• Automatically detects builders in range, selected, or guarding
+
+🔧 Idle Detection Logic:
+• Mobile builders: Not building + not moving + (no commands OR only GUARD)
+• Nano turrets: Not building + (no work commands OR only GUARD/FIGHT)
+• Units actively building are NEVER idle (even if guarding)
 ]],
         author = "Pyrem, enhanced by Waleed",
-        version = "2.6.0",
-        date = "2024",
+        version = "2.7.3",
+        date = "2025",
         license = "GNU GPL, v2 or later",
         layer = -999,
         enabled = true
@@ -61,9 +97,17 @@ local lastPlayerCheck = 0
 local UPDATE_FREQUENCY = 15 -- Update every 15 frames (0.5s at 30 fps)
 local HOVER_CHECK_FREQUENCY = 6 -- Check hover every 6 frames (0.2s at 30 fps)
 local PLAYER_CHECK_FREQUENCY = 90 -- Check player status every 90 frames (3s)
+local HOVER_TEAM_SWITCH_DELAY = 30 -- Delay before switching teams on hover (1s at 30 fps)
 local frameCounter = 0
 local lastHoverUpdate = 0
 local lastHoverCheck = 0
+
+-- 🎯 Hover-based team switching for spectators
+local hoveredTeamID = nil
+local hoveredTeamStartFrame = 0
+local lastHoverTeamSwitch = 0
+local manualTeamOverride = nil  -- Stores manually selected team (via hover)
+local hasManualOverride = false  -- Flag to prevent auto-reset
 
 -- 🚀 Performance caching system
 local unitCache = {}  -- Cache unit properties that don't change often
@@ -134,6 +178,52 @@ local ECO_GRAY = "\255\200\200\200"   -- Default
 -- Font system
 local font
 
+-- 🔍 Detect which team spectator should track based on selected units
+local function detectSpectatorTargetTeam()
+    if not isSpectator then
+        return myTeamID
+    end
+    
+    -- Check if spectator has full view
+    local spec, fullView, fullSelect = Spring.GetSpectatingState()
+    if not fullView then
+        return myTeamID  -- Limited spectator, use own team
+    end
+    
+    -- PRIORITY 1: Use manual override if set (from hover switching)
+    if hasManualOverride and manualTeamOverride then
+        return manualTeamOverride
+    end
+    
+    -- PRIORITY 2: Check selected units to determine which team to track
+    local selectedUnits = Spring.GetSelectedUnits()
+    if selectedUnits and #selectedUnits > 0 then
+        -- Use the team of the first selected unit
+        local unitTeam = Spring.GetUnitTeam(selectedUnits[1])
+        if unitTeam then
+            return unitTeam
+        end
+    end
+    
+    -- PRIORITY 3: No units selected, try to find first valid team with units
+    local teamList = Spring.GetTeamList()
+    if teamList then
+        for _, teamID in ipairs(teamList) do
+            local teamUnits = Spring.GetTeamUnits(teamID)
+            if teamUnits and #teamUnits > 0 then
+                -- Check if this is a real player team (not Gaia)
+                local _, leader = Spring.GetTeamInfo(teamID)
+                if leader and leader >= 0 then
+                    return teamID
+                end
+            end
+        end
+    end
+    
+    -- Fallback to own team
+    return myTeamID
+end
+
 -- 👤 Player identification functions
 local function updatePlayerInfo()
     myPlayerID = Spring.GetMyPlayerID()
@@ -141,18 +231,30 @@ local function updatePlayerInfo()
     myTeamID = teamID
     isSpectator = spec
     
-    -- In spectator mode, default to tracking our own player initially
-    -- Later we can add UI to switch between players
+    -- Detect which team to track
     if isSpectator then
-        targetPlayerID = myPlayerID
-        targetTeamID = myTeamID
+        targetTeamID = detectSpectatorTargetTeam()
+        -- Find the player ID for this team
+        local _, leader = Spring.GetTeamInfo(targetTeamID)
+        targetPlayerID = leader or myPlayerID
     else
         targetPlayerID = myPlayerID  
         targetTeamID = myTeamID
     end
     
     -- Get player name for display
-    local playerName = Spring.GetPlayerInfo(targetPlayerID) or "Unknown"
+    local playerName = "Unknown"
+    if targetPlayerID and targetPlayerID >= 0 then
+        playerName = Spring.GetPlayerInfo(targetPlayerID) or "Unknown"
+    elseif targetTeamID then
+        -- Try to get team name if no player ID
+        local _, leader = Spring.GetTeamInfo(targetTeamID)
+        if leader and leader >= 0 then
+            playerName = Spring.GetPlayerInfo(leader) or "Team " .. targetTeamID
+        else
+            playerName = "Team " .. targetTeamID
+        end
+    end
     cachedResults.playerName = playerName
 end
 
@@ -555,13 +657,15 @@ local function calculateConstructionInfo(unitID, buildProgress)
     hoveredResults.ecoStatus = ecoStatus
     hoveredResults.metalPerSecond = metalPerSecond
     hoveredResults.energyPerSecond = energyPerSecond
+    hoveredResults.remainingMetalCost = remainingMetalCost
+    hoveredResults.remainingEnergyCost = remainingEnergyCost
 end
 
 -- Display hover info for construction
 local function displayHoverInfo()
     local mx, my = Spring.GetMouseState()
     
-    local totalHeight = 80 + 30
+    local totalHeight = 100 + 30  -- Increased for better spacing
     local screenX, screenY = mx, my - totalHeight
     
     local ecoStatus = hoveredResults.ecoStatus
@@ -582,21 +686,47 @@ local function displayHoverInfo()
         
         font:Print(timerColor .. "⏱️ " .. timeText .. " (" .. buildProgressPercent .. "%)", screenX, screenY, 24, "co")
         
-        -- Show player name in spectator mode
+        -- Show player name in spectator mode with hover indicator
         if isSpectator and cachedResults.playerName then
-            font:Print(ECO_GRAY .. "👤 " .. cachedResults.playerName, screenX, screenY - 15, 12, "co")
+            local currentFrame = Spring.GetGameFrame()
+            local hoverIndicator = ""
+            
+            -- Show pending hover switch
+            if hoveredTeamID and hoveredTeamID ~= targetTeamID then
+                local hoverTime = currentFrame - hoveredTeamStartFrame
+                if hoverTime < HOVER_TEAM_SWITCH_DELAY then
+                    local progress = math.floor((hoverTime / HOVER_TEAM_SWITCH_DELAY) * 100)
+                    local hoveredPlayerName = "Unknown"
+                    local _, leader = Spring.GetTeamInfo(hoveredTeamID)
+                    if leader and leader >= 0 then
+                        hoveredPlayerName = Spring.GetPlayerInfo(leader) or "Team " .. hoveredTeamID
+                    else
+                        hoveredPlayerName = "Team " .. hoveredTeamID
+                    end
+                    hoverIndicator = " → " .. hoveredPlayerName .. " (" .. progress .. "%)"
+                end
+            end
+            
+            font:Print(ECO_GRAY .. "👤 " .. cachedResults.playerName .. hoverIndicator, screenX, screenY - 20, 14, "co")
         end
         
         -- Build power being applied
         local buildPowerPerSecond = hoveredResults.buildPowerPerSecond or 0
-        font:Print(ECO_GRAY .. "Build • " .. formatNumber(buildPowerPerSecond) .. " BP/s", screenX, screenY - 30, 14, "co")
+        font:Print(ECO_GRAY .. "Build • " .. formatNumber(buildPowerPerSecond) .. " BP/s", screenX, screenY - 40, 16, "co")
         
         -- Usage rates
         local metalPerSecond = hoveredResults.metalPerSecond or 0
         local energyPerSecond = hoveredResults.energyPerSecond or 0
         font:Print(ECO_GRAY .. "Usage • " .. formatNumber(metalPerSecond) .. " M/s • " .. 
                   formatNumber(energyPerSecond) .. " E/s", 
-                  screenX, screenY - 45, 12, "co")
+                  screenX, screenY - 60, 14, "co")
+        
+        -- Remaining resources required
+        local remainingMetal = hoveredResults.remainingMetalCost or 0
+        local remainingEnergy = hoveredResults.remainingEnergyCost or 0
+        font:Print(ECO_GRAY .. "Remaining • " .. formatNumber(remainingMetal) .. " M • " .. 
+                  formatNumber(remainingEnergy) .. " E", 
+                  screenX, screenY - 80, 14, "co")
         
         if ecoStatus then
             -- Show storage availability
@@ -608,30 +738,7 @@ local function displayHoverInfo()
             font:Print(ECO_GRAY .. "Storage " ..
                       metalStorageColor .. "• " .. formatNumber(metalStored) .. " M " ..
                       energyStorageColor .. "• " .. formatNumber(energyStored) .. " E",
-                      screenX, screenY - 60, 12, "co")
-                      
-            -- Show production constraints
-            local metalDeficit = ecoStatus.metalDeficit or 0
-            local energyDeficit = ecoStatus.energyDeficit or 0
-            if metalDeficit > 0 or energyDeficit > 0 then
-                local eco = getEconomyInfo()
-                local metalProduction = eco.metalNet or 0
-                local energyProduction = eco.energyNet or 0
-                local metalRequired = hoveredResults.metalPerSecond or 0
-                local energyRequired = hoveredResults.energyPerSecond or 0
-                
-                local productionText = ""
-                local hasProduction = false
-                if metalDeficit > 0 and metalRequired > 0 then
-                    productionText = productionText .. string.format("• %.0f/%.0f M/s", metalProduction, metalRequired)
-                    hasProduction = true
-                end
-                if energyDeficit > 0 and energyRequired > 0 then
-                    if hasProduction then productionText = productionText .. " " end
-                    productionText = productionText .. string.format("• %.0f/%.0f E/s", energyProduction, energyRequired)
-                end
-                font:Print(ECO_GRAY .. "Production " .. ECO_RED .. productionText, screenX, screenY - 75, 12, "co")
-            end
+                      screenX, screenY - 100, 14, "co")
         end
         
         font:End()
@@ -654,11 +761,16 @@ local function displayHoverInfo()
         gl.Text("Usage • " .. formatNumber(metalPerSecond) .. " M/s • " .. 
                 formatNumber(energyPerSecond) .. " E/s", screenX, screenY - 45, 12, "co")
         
+        local remainingMetal = hoveredResults.remainingMetalCost or 0
+        local remainingEnergy = hoveredResults.remainingEnergyCost or 0
+        gl.Text("Remaining • " .. formatNumber(remainingMetal) .. " M • " .. 
+                formatNumber(remainingEnergy) .. " E", screenX, screenY - 60, 12, "co")
+        
         if ecoStatus then
             local metalStored = ecoStatus.metalStored or 0
             local energyStored = ecoStatus.energyStored or 0
             gl.Text("Storage • " .. formatNumber(metalStored) .. " M • " .. 
-                    formatNumber(energyStored) .. " E", screenX, screenY - 60, 12, "co")
+                    formatNumber(energyStored) .. " E", screenX, screenY - 75, 12, "co")
         end
     end
 end
@@ -717,6 +829,39 @@ function widget:PlayerChanged(playerID)
     Spring.Echo("Build Timer v2: Player changed, now in " .. modeText .. " tracking " .. (cachedResults.playerName or "unknown player"))
 end
 
+-- Handle unit selection changes (for spectator team switching)
+function widget:SelectionChanged(selectedUnits)
+    if not isSpectator then
+        return  -- Only relevant for spectators
+    end
+    
+    -- Check if we have a new team selected
+    if selectedUnits and #selectedUnits > 0 then
+        local newTeam = Spring.GetUnitTeam(selectedUnits[1])
+        if newTeam then
+            -- Clear manual override when user explicitly selects units
+            hasManualOverride = false
+            manualTeamOverride = nil
+            
+            if newTeam ~= targetTeamID then
+                -- Team has changed, update player info
+                updatePlayerInfo()
+                
+                -- Clear caches to force refresh
+                unitCache = {}
+                lastCacheUpdate = 0
+                cachedResults.isActive = false
+                hoveredResults.isActive = false
+                
+                Spring.Echo("Build Timer v2: Selection-switched to " .. (cachedResults.playerName or "unknown player"))
+            end
+        end
+    else
+        -- No units selected - keep the current team (either manual or last selected)
+        -- Don't clear manual override here, let hover-switching persist
+    end
+end
+
 -- Key handler for idle builder toggle (press to toggle on/off)
 function widget:KeyPress(key, mods, isRepeat)
     if (key == BACKTICK_KEY_1 or key == BACKTICK_KEY_2) and not isRepeat then
@@ -754,9 +899,31 @@ end
 function widget:GameFrame()
     frameCounter = frameCounter + 1
     
-    -- Periodically update player status
+    -- Periodically update player status and check for team changes in spectator mode
     if frameCounter % PLAYER_CHECK_FREQUENCY == 0 then
-        updatePlayerInfo()
+        -- Only update if we don't have a manual override
+        if not hasManualOverride then
+            local oldTeamID = targetTeamID
+            updatePlayerInfo()
+            
+            -- If team changed, clear caches
+            if oldTeamID ~= targetTeamID then
+                unitCache = {}
+                lastCacheUpdate = 0
+                cachedResults.isActive = false
+                hoveredResults.isActive = false
+                
+                if isSpectator then
+                    Spring.Echo("Build Timer v2: Auto-switched to tracking " .. (cachedResults.playerName or "unknown player"))
+                end
+            end
+        else
+            -- Just update player info without changing teams
+            myPlayerID = Spring.GetMyPlayerID()
+            local _, _, spec, teamID = Spring.GetPlayerInfo(myPlayerID)
+            myTeamID = teamID
+            isSpectator = spec
+        end
     end
     
     -- Only process every UPDATE_FREQUENCY frames
@@ -955,6 +1122,8 @@ function widget:GameFrame()
         cachedResults.ecoStatus = ecoStatus
         cachedResults.metalPerSecond = metalPerSecond
         cachedResults.energyPerSecond = energyPerSecond
+        cachedResults.metalCost = metalCost
+        cachedResults.energyCost = energyCost
     end
     
     -- 🌐 Share data with other widgets via WG table
@@ -981,6 +1150,51 @@ function widget:DrawScreen()
             
             for _, unitID in ipairs(unitsAtPos or {}) do
                 if unitID and Spring.ValidUnitID(unitID) then
+                    -- 🎯 Check for hover-based team switching in spectator mode
+                    if isSpectator then
+                        local unitTeam = Spring.GetUnitTeam(unitID)
+                        if unitTeam and unitTeam ~= targetTeamID then
+                            local currentFrame = Spring.GetGameFrame()
+                            
+                            -- Track if we're hovering over a new team
+                            if unitTeam ~= hoveredTeamID then
+                                hoveredTeamID = unitTeam
+                                hoveredTeamStartFrame = currentFrame
+                            elseif (currentFrame - hoveredTeamStartFrame) >= HOVER_TEAM_SWITCH_DELAY and
+                                   (currentFrame - lastHoverTeamSwitch) >= (HOVER_TEAM_SWITCH_DELAY * 2) then
+                                -- Switch to hovered team after delay (with cooldown)
+                                targetTeamID = unitTeam
+                                manualTeamOverride = unitTeam  -- Set manual override
+                                hasManualOverride = true        -- Enable override flag
+                                
+                                -- Find the player ID for this team
+                                local _, leader = Spring.GetTeamInfo(targetTeamID)
+                                targetPlayerID = leader or targetPlayerID
+                                
+                                -- Update player name
+                                local playerName = "Unknown"
+                                if targetPlayerID and targetPlayerID >= 0 then
+                                    playerName = Spring.GetPlayerInfo(targetPlayerID) or "Unknown"
+                                else
+                                    playerName = "Team " .. targetTeamID
+                                end
+                                cachedResults.playerName = playerName
+                                
+                                -- Clear caches for fresh data
+                                unitCache = {}
+                                lastCacheUpdate = 0
+                                cachedResults.isActive = false
+                                
+                                lastHoverTeamSwitch = currentFrame
+                                Spring.Echo("Build Timer v2: Hover-switched to " .. playerName .. " (locked)")
+                            end
+                        else
+                            -- Reset hover tracking if hovering over same team
+                            hoveredTeamID = targetTeamID
+                            hoveredTeamStartFrame = Spring.GetGameFrame()
+                        end
+                    end
+                    
                     local health, maxHealth, paralyze, capture, buildProgress = Spring.GetUnitHealth(unitID)
                     
                     -- Check if unit is under construction
@@ -1069,7 +1283,58 @@ function widget:DrawScreen()
         local _, pos = Spring.TraceScreenRay(mx, my, true)
         
         if pos then
-            local totalHeight = 65 + 30
+            -- 🎯 Check for hover-based team switching in build mode (spectator only)
+            if isSpectator then
+                local unitsAtMouse = Spring.GetUnitsInCylinder(pos[1], pos[3], 100)
+                for _, unitID in ipairs(unitsAtMouse or {}) do
+                    if unitID and Spring.ValidUnitID(unitID) then
+                        local unitTeam = Spring.GetUnitTeam(unitID)
+                        if unitTeam and unitTeam ~= targetTeamID then
+                            local currentFrame = Spring.GetGameFrame()
+                            
+                            -- Track if we're hovering over a new team
+                            if unitTeam ~= hoveredTeamID then
+                                hoveredTeamID = unitTeam
+                                hoveredTeamStartFrame = currentFrame
+                            elseif (currentFrame - hoveredTeamStartFrame) >= HOVER_TEAM_SWITCH_DELAY and
+                                   (currentFrame - lastHoverTeamSwitch) >= (HOVER_TEAM_SWITCH_DELAY * 2) then
+                                -- Switch to hovered team after delay
+                                targetTeamID = unitTeam
+                                manualTeamOverride = unitTeam  -- Set manual override
+                                hasManualOverride = true        -- Enable override flag
+                                
+                                -- Find the player ID for this team
+                                local _, leader = Spring.GetTeamInfo(targetTeamID)
+                                targetPlayerID = leader or targetPlayerID
+                                
+                                -- Update player name
+                                local playerName = "Unknown"
+                                if targetPlayerID and targetPlayerID >= 0 then
+                                    playerName = Spring.GetPlayerInfo(targetPlayerID) or "Unknown"
+                                else
+                                    playerName = "Team " .. targetTeamID
+                                end
+                                cachedResults.playerName = playerName
+                                
+                                -- Clear caches for fresh data
+                                unitCache = {}
+                                lastCacheUpdate = 0
+                                cachedResults.isActive = false
+                                
+                                lastHoverTeamSwitch = currentFrame
+                                Spring.Echo("Build Timer v2: Hover-switched to " .. playerName .. " (locked)")
+                            end
+                            break  -- Found a unit, stop checking
+                        else
+                            -- Reset hover tracking if hovering over same team
+                            hoveredTeamID = targetTeamID
+                            hoveredTeamStartFrame = Spring.GetGameFrame()
+                        end
+                    end
+                end
+            end
+            
+            local totalHeight = 110 + 30  -- Adjusted for better spacing
             local screenX, screenY = mx, my - totalHeight
             
             if screenX and screenY then
@@ -1091,15 +1356,34 @@ function widget:DrawScreen()
                     
                     -- Show idle mode indicator
                     if cachedResults.showingIdle then
-                        font:Print(ECO_GRAY .. "🎯 IDLE BUILDER MODE", screenX, screenY - 25, 16, "co")
+                        font:Print(ECO_GRAY .. "🎯 IDLE BUILDER MODE", screenX, screenY - 30, 16, "co")
                         font:Print(timerColor .. "⏱️ " .. cachedResults.timeText, screenX, screenY, 24, "co")
                     else
                         font:Print(timerColor .. "⏱️ " .. cachedResults.timeText, screenX, screenY, 24, "co")
                     end
                     
-                    -- Show player name in spectator mode
+                    -- Show player name in spectator mode with hover indicator
                     if isSpectator and cachedResults.playerName then
-                        font:Print(ECO_GRAY .. "👤 " .. cachedResults.playerName, screenX, screenY - 15, 12, "co")
+                        local currentFrame = Spring.GetGameFrame()
+                        local hoverIndicator = ""
+                        
+                        -- Show pending hover switch
+                        if hoveredTeamID and hoveredTeamID ~= targetTeamID then
+                            local hoverTime = currentFrame - hoveredTeamStartFrame
+                            if hoverTime < HOVER_TEAM_SWITCH_DELAY then
+                                local progress = math.floor((hoverTime / HOVER_TEAM_SWITCH_DELAY) * 100)
+                                local hoveredPlayerName = "Unknown"
+                                local _, leader = Spring.GetTeamInfo(hoveredTeamID)
+                                if leader and leader >= 0 then
+                                    hoveredPlayerName = Spring.GetPlayerInfo(leader) or "Team " .. hoveredTeamID
+                                else
+                                    hoveredPlayerName = "Team " .. hoveredTeamID
+                                end
+                                hoverIndicator = " → " .. hoveredPlayerName .. " (" .. progress .. "%)"
+                            end
+                        end
+                        
+                        font:Print(ECO_GRAY .. "👤 " .. cachedResults.playerName .. hoverIndicator, screenX, screenY - 20, 14, "co")
                     end
                     
                     -- Builder and turret count
@@ -1138,51 +1422,35 @@ function widget:DrawScreen()
                         builderText = "(" .. table.concat(parts, ", ") .. ")"
                     end
                     
-                    local yOffset = cachedResults.showingIdle and -45 or (isSpectator and -35 or -20)
+                    local yOffset = cachedResults.showingIdle and -50 or (isSpectator and -40 or -25)
                     font:Print(ECO_GRAY .. builderText, screenX, screenY + yOffset, 14, "co")
                     
                     -- Usage rates
-                    yOffset = cachedResults.showingIdle and -60 or (isSpectator and -50 or -35)
+                    yOffset = cachedResults.showingIdle and -70 or (isSpectator and -60 or -40)
                     font:Print(ECO_GRAY .. "Usage • " .. formatNumber(cachedResults.metalPerSecond) .. " M/s • " .. 
                               formatNumber(cachedResults.energyPerSecond) .. " E/s", 
-                              screenX, screenY + yOffset, 12, "co")
+                              screenX, screenY + yOffset, 14, "co")
+                    
+                    -- Required resources
+                    yOffset = cachedResults.showingIdle and -90 or (isSpectator and -80 or -60)
+                    font:Print(ECO_GRAY .. "Required • " .. formatNumber(cachedResults.metalCost) .. " M • " .. 
+                              formatNumber(cachedResults.energyCost) .. " E", 
+                              screenX, screenY + yOffset, 14, "co")
                     
                     -- Storage availability (gray in idle mode)
                     local metalStorageColor = cachedResults.showingIdle and ECO_GRAY or (ecoStatus.hasMetalStorage and ECO_GREEN or ECO_RED)
                     local energyStorageColor = cachedResults.showingIdle and ECO_GRAY or (ecoStatus.hasEnergyStorage and ECO_GREEN or ECO_RED)
                     
-                    yOffset = cachedResults.showingIdle and -75 or (isSpectator and -65 or -50)
+                    yOffset = cachedResults.showingIdle and -110 or (isSpectator and -100 or -80)
                     font:Print(ECO_GRAY .. "Storage " ..
                               metalStorageColor .. "• " .. formatNumber(ecoStatus.metalStored) .. " M " ..
                               energyStorageColor .. "• " .. formatNumber(ecoStatus.energyStored) .. " E",
-                              screenX, screenY + yOffset, 12, "co")
-                    
-                    -- Production constraints
-                    if ecoStatus.metalDeficit > 0 or ecoStatus.energyDeficit > 0 then
-                        local eco = getEconomyInfo()
-                        local metalProduction = eco.metalNet or 0
-                        local energyProduction = eco.energyNet or 0
-                        local metalRequired = cachedResults.metalPerSecond or 0
-                        local energyRequired = cachedResults.energyPerSecond or 0
-                        
-                        local productionText = ""
-                        local hasProduction = false
-                        if ecoStatus.metalDeficit > 0 and metalRequired > 0 then
-                            productionText = productionText .. string.format("• %.0f/%.0f M/s", metalProduction, metalRequired)
-                            hasProduction = true
-                        end
-                        if ecoStatus.energyDeficit > 0 and energyRequired > 0 then
-                            if hasProduction then productionText = productionText .. " " end
-                            productionText = productionText .. string.format("• %.0f/%.0f E/s", energyProduction, energyRequired)
-                        end
-                        yOffset = cachedResults.showingIdle and -90 or (isSpectator and -80 or -65)
-                        font:Print(ECO_GRAY .. "Production " .. (cachedResults.showingIdle and ECO_GRAY or ECO_RED) .. productionText, screenX, screenY + yOffset, 12, "co")
-                    end
+                              screenX, screenY + yOffset, 14, "co")
                     
                     -- 🎯 Command feedback
                     local currentFrame = Spring.GetGameFrame()
                     if commandFeedbackTime > currentFrame then
-                        font:Print(ECO_GRAY .. lastCommandFeedback, screenX, screenY - 95, 12, "co")
+                        font:Print(ECO_GRAY .. lastCommandFeedback, screenX, screenY - 130, 14, "co")
                     end
                     
                     font:End()
@@ -1247,8 +1515,12 @@ function widget:DrawScreen()
                     gl.Text("Usage • " .. formatNumber(cachedResults.metalPerSecond) .. " M/s • " .. 
                             formatNumber(cachedResults.energyPerSecond) .. " E/s", screenX, screenY + yOffset, 12, "co")
                     
-                    -- Storage with colors
                     yOffset = isSpectator and -65 or -50
+                    gl.Text("Required • " .. formatNumber(cachedResults.metalCost) .. " M • " .. 
+                            formatNumber(cachedResults.energyCost) .. " E", screenX, screenY + yOffset, 12, "co")
+                    
+                    -- Storage with colors
+                    yOffset = isSpectator and -80 or -65
                     gl.Color(0.8, 0.8, 0.8, 1)
                     gl.Text("Storage: ", screenX, screenY + yOffset, 12, "co")
                     
@@ -1260,32 +1532,6 @@ function widget:DrawScreen()
                     
                     gl.Color(energyStorageColorGL[1], energyStorageColorGL[2], energyStorageColorGL[3], energyStorageColorGL[4])
                     gl.Text("• " .. formatNumber(ecoStatus.energyStored) .. " E", screenX + 90, screenY + yOffset, 12, "co")
-                    
-                    -- Production constraints
-                    if ecoStatus.metalDeficit > 0 or ecoStatus.energyDeficit > 0 then
-                        local eco = getEconomyInfo()
-                        local metalProduction = eco.metalNet or 0
-                        local energyProduction = eco.energyNet or 0
-                        local metalRequired = cachedResults.metalPerSecond or 0
-                        local energyRequired = cachedResults.energyPerSecond or 0
-                        
-                        local productionText = ""
-                        local hasProduction = false
-                        if ecoStatus.metalDeficit > 0 and metalRequired > 0 then
-                            productionText = productionText .. string.format("• %.0f/%.0f M/s", metalProduction, metalRequired)
-                            hasProduction = true
-                        end
-                        if ecoStatus.energyDeficit > 0 and energyRequired > 0 then
-                            if hasProduction then productionText = productionText .. " " end
-                            productionText = productionText .. string.format("• %.0f/%.0f E/s", energyProduction, energyRequired)
-                        end
-                        
-                        yOffset = isSpectator and -80 or -65
-                        gl.Color(0.8, 0.8, 0.8, 1)
-                        gl.Text("Production ", screenX, screenY + yOffset, 12, "co")
-                        gl.Color(0.94, 0.49, 0.49, 1)
-                        gl.Text(productionText, screenX + 65, screenY + yOffset, 12, "co")
-                    end
                 end
             end
         end
