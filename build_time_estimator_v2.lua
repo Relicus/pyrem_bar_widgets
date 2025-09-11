@@ -76,7 +76,7 @@ v2.7.0 (2025):
 • Nano turrets: Not building + (no work commands OR only GUARD/FIGHT)
 • Units actively building are NEVER idle (even if guarding)
 ]],
-        author = "Pyrem, enhanced by Waleed",
+        author = "Pyrem",
         version = "2.7.3",
         date = "2025",
         license = "GNU GPL, v2 or later",
