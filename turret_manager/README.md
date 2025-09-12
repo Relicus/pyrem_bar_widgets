@@ -210,7 +210,7 @@ Contributions welcome! The codebase follows DRY principles for easy modification
 
 See [CHANGELOG.md](CHANGELOG.md) for detailed version history.
 
-### Latest Version (4.1.0)
+### Latest Version (4.1.0) (Internal but for you guys v1.0)
 - Complete DRY refactor with helper functions
 - 40% smaller visual indicators
 - Green dashed eco ring
@@ -229,17 +229,14 @@ GNU General Public License v2.0 or later - see [LICENSE](LICENSE) for details.
 - BAR community for testing and feedback
 
 ## 📞 Support
-
-- **Bug Reports**: [GitHub Issues](https://github.com/pyrem/bar-turret-manager/issues)
+- **Bug Reports**: [GitHub Issues](https://github.com/Relicus/bar-turret-manager/issues)
 - **Discord**: Find us on [BAR Discord](https://discord.gg/beyond-all-reason)
 - **Forums**: [BAR Forums](https://www.beyondallreason.info/forums)
 
 ## 🎮 Related Widgets
 
 Check out these complementary widgets:
-- [Build Time Estimator v2](https://github.com/pyrem/bar-build-timer) - Real-time build predictions
-- [Advanced Auto-Build](https://github.com/pyrem/bar-auto-build) - Intelligent construction assistance
-- [Economy Manager](https://github.com/pyrem/bar-eco-manager) - Resource optimization
+- [Build Time Estimator v2](https://github.com/Relicus/pyrem_bar_widgets/blob/main/build_time_estimator_v2.lua) - Real-time build predictions
 
 ---
 
