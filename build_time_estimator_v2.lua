@@ -18,7 +18,7 @@ Spring.Echo("BTEv2: File loading started...")
 
 function widget:GetInfo()
     return {
-        name = "⏱️ Build Timer v2 by Pyrem",
+        name = "⏱️ Build Timer v2 (Pyrem)",
         desc = [[
 🎯 Advanced build time calculation system for Beyond All Reason with economy-aware predictions.
 
