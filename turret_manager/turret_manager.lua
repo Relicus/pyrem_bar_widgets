@@ -3,6 +3,8 @@
 🎯 TURRET MANAGER - Intelligent Nano Turret Automation & Control
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+Originally created by augustin - Redesigned and enhanced by Pyrem
+
 📋 FEATURES:
 • Individual per-turret settings with visual indicators
 • Smart guard handling - helps when needed, works independently when idle
@@ -477,6 +479,7 @@ local DEFAULT_SETTINGS = {
 local turretDefIDs = {}        -- Construction turret definitions
 local UNIT_TIERS = {}          -- Tier classification cache
 local UNIT_CATEGORIES = {}     -- Category classification cache
+local UNIT_GROUPS = {}         -- Unit group cache from customParams
 
 -- Turret management
 local watchedTurrets = {}      -- Active turret tracking
@@ -539,45 +542,92 @@ local function getUnitTier(unitDefID)
         return 1 
     end
     
-    local tier = 1
+    local tier = nil
+    local tierSource = "default"
     
-    -- Check custom params first (try both cases)
+    -- Check custom params (all variations)
     if unitDef.customParams then
         if unitDef.customParams.techlevel then
-            tier = tonumber(unitDef.customParams.techlevel) or 1
-        elseif unitDef.customParams.techLevel then  -- Check camelCase version
-            tier = tonumber(unitDef.customParams.techLevel) or 1
-        end
-    -- Also check lowercase version
-    elseif unitDef.customparams then
-        if unitDef.customparams.techlevel then
-            tier = tonumber(unitDef.customparams.techlevel) or 1
-        elseif unitDef.customparams.techLevel then  -- Check camelCase version
-            tier = tonumber(unitDef.customparams.techLevel) or 1
+            tier = tonumber(unitDef.customParams.techlevel)
+            tierSource = "customParams.techlevel"
+        elseif unitDef.customParams.techLevel then
+            tier = tonumber(unitDef.customParams.techLevel)
+            tierSource = "customParams.techLevel"
+        elseif unitDef.customParams.tech_level then
+            tier = tonumber(unitDef.customParams.tech_level)
+            tierSource = "customParams.tech_level"
         end
     end
     
-    -- If no techlevel found, use cost-based detection
-    if tier == 1 and unitDef.metalCost then
-        local cost = unitDef.metalCost
-        local name = unitDef.name or ""
-        
-        -- Cost thresholds (approximate)
-        if cost > 10000 or string.find(name, "[tT]4") or string.find(name, "exp") then
-            tier = 4
-        elseif cost > 2000 or string.find(name, "[tT]3") or string.find(name, "afus") then
-            tier = 3  
-        elseif cost > 500 or string.find(name, "[tT]2") or string.find(name, "adv") then
-            tier = 2
+    -- Also check lowercase customparams
+    if not tier and unitDef.customparams then
+        if unitDef.customparams.techlevel then
+            tier = tonumber(unitDef.customparams.techlevel)
+            tierSource = "customparams.techlevel"
+        elseif unitDef.customparams.techLevel then
+            tier = tonumber(unitDef.customparams.techLevel)
+            tierSource = "customparams.techLevel"
         end
+    end
+    
+    -- Default to tier 1 if no tech level found
+    if not tier then
+        tier = 1
+        tierSource = "default (no customParams)"
     end
     
     if DEBUG_MODE then
-        Spring.Echo("V4 Tier: " .. unitDef.name .. " = T" .. tier .. " (cost: " .. (unitDef.metalCost or 0) .. ")")
+        Spring.Echo("Tech Level: " .. unitDef.name .. " = T" .. tier .. " (source: " .. tierSource .. ")")
     end
     
     UNIT_TIERS[unitDefID] = tier
     return tier
+end
+
+local function getUnitGroup(unitDefID)
+    if UNIT_GROUPS[unitDefID] then
+        return UNIT_GROUPS[unitDefID]
+    end
+    
+    local unitDef = UnitDefs[unitDefID]
+    if not unitDef then 
+        UNIT_GROUPS[unitDefID] = "other"
+        return "other" 
+    end
+    
+    local unitGroup = nil
+    
+    -- Check custom params for unit group (all variations)
+    if unitDef.customParams then
+        if unitDef.customParams.unitgroup then
+            unitGroup = unitDef.customParams.unitgroup
+        elseif unitDef.customParams.unitGroup then
+            unitGroup = unitDef.customParams.unitGroup
+        elseif unitDef.customParams.unit_group then
+            unitGroup = unitDef.customParams.unit_group
+        end
+    end
+    
+    -- Also check lowercase customparams
+    if not unitGroup and unitDef.customparams then
+        if unitDef.customparams.unitgroup then
+            unitGroup = unitDef.customparams.unitgroup
+        elseif unitDef.customparams.unitGroup then
+            unitGroup = unitDef.customparams.unitGroup
+        end
+    end
+    
+    -- Default to "other" if no group found
+    if not unitGroup then
+        unitGroup = "other"
+    end
+    
+    if DEBUG_MODE then
+        Spring.Echo("Unit Group: " .. unitDef.name .. " = " .. unitGroup)
+    end
+    
+    UNIT_GROUPS[unitDefID] = unitGroup
+    return unitGroup
 end
 
 local function getUnitCategory(unitDefID)
@@ -766,6 +816,7 @@ local function findBuildTargets(turretID, settings)
                 if unitDefID then
                     local tier = getUnitTier(unitDefID)
                     local category = getUnitCategory(unitDefID)
+                    local unitGroup = getUnitGroup(unitDefID)
                     local ux, _, uz = Spring.GetUnitPosition(unitID)
                     if ux and uz then
                         local distance = Distance.exact(tx, tz, ux, uz)
@@ -773,24 +824,26 @@ local function findBuildTargets(turretID, settings)
                         if DEBUG_MODE then
                             local unitDef = UnitDefs[unitDefID]
                             if unitDef then
-                                local catSymbol = category == "resource" and "💰" or 
-                                                 category == "defense" and "🛡️" or
-                                                 category == "intel" and "📡" or
-                                                 category == "factory" and "🏭" or
-                                                 category == "builder" and "🔧" or
-                                                 category == "assist" and "🤖" or "🏗️"
+                                local groupSymbol = unitGroup == "energy" and "⚡" or
+                                                   unitGroup == "metal" and "🔩" or
+                                                   unitGroup == "utils" and "🔧" or
+                                                   unitGroup == "weapon" and "⚔️" or
+                                                   unitGroup == "builder" and "🏗️" or
+                                                   unitGroup == "buildert2" and "🏗️²" or
+                                                   unitGroup == "aa" and "🎯" or "❓"
                                 Spring.Echo("  Found: " .. unitDef.name .. " = T" .. tier .. 
-                                          " " .. catSymbol .. "(" .. category .. ") progress=" .. math.floor(buildProgress * 100) .. 
+                                          " " .. groupSymbol .. "(" .. unitGroup .. ") progress=" .. math.floor(buildProgress * 100) .. 
                                           "% at " .. math.floor(distance) .. " range")
                             end
                         end
                         
-                        -- Store unit with distance and category for later sorting
+                        -- Store unit with distance and unit group for later sorting
                         table.insert(tierUnits[tier], {
                             id = unitID,
                             distance = distance,
                             progress = buildProgress,
-                            category = category
+                            category = category,
+                            unitGroup = unitGroup
                         })
                     end
                 end
@@ -821,9 +874,9 @@ local function findBuildTargets(turretID, settings)
                     local unitDefID = Spring.GetUnitDefID(unit.id)
                     local unitDef = unitDefID and UnitDefs[unitDefID]
                     if unitDef and i <= 3 then  -- Show first 3
-                        Spring.Echo("    - " .. unitDef.name .. " (progress: " .. 
-                                   math.floor(unit.progress * 100) .. "%, dist: " .. 
-                                   math.floor(unit.distance) .. ")")
+                        Spring.Echo("    - " .. unitDef.name .. " (" .. unit.unitGroup .. 
+                                   ", progress: " .. math.floor(unit.progress * 100) .. 
+                                   "%, dist: " .. math.floor(unit.distance) .. ")")
                     end
                 end
             end
@@ -862,82 +915,128 @@ local function findBuildTargets(turretID, settings)
     -- If we have units to choose from
     if #units > 0 then
         
-        -- Apply strict priority grouping: Tier → Eco → Distance
         local targetUnit = nil
         
-        if settings.ecoEnabled then
-            -- Separate resource and non-resource units
-            local resourceUnits = {}
-            local otherUnits = {}
-            
-            for _, unit in ipairs(units) do
-                if unit.category == "resource" then
-                    table.insert(resourceUnits, unit)
-                else
-                    table.insert(otherUnits, unit)
-                end
-            end
-            
-            if DEBUG_MODE then
-                local tierLabel = selectedTier == "ALL" and "all tiers" or ("T" .. selectedTier)
-                Spring.Echo("  ECO PRIORITY: Found " .. #resourceUnits .. " resource units and " .. 
-                           #otherUnits .. " other units in " .. tierLabel)
-                -- Show what we found
-                for i, unit in ipairs(resourceUnits) do
-                    local unitDefID = Spring.GetUnitDefID(unit.id)
-                    local unitDef = unitDefID and UnitDefs[unitDefID]
-                    if unitDef then
-                        Spring.Echo("    Resource[" .. i .. "]: " .. unitDef.name .. " at " .. math.floor(unit.distance))
-                    end
-                end
-                for i, unit in ipairs(otherUnits) do
-                    if i <= 3 then  -- Only show first 3 to avoid spam
-                        local unitDefID = Spring.GetUnitDefID(unit.id)
-                        local unitDef = unitDefID and UnitDefs[unitDefID]
-                        if unitDef then
-                            Spring.Echo("    Other[" .. i .. "]: " .. unitDef.name .. " at " .. math.floor(unit.distance))
-                        end
-                    end
-                end
-            end
-            
-            -- Prioritize resource units if any exist
-            if #resourceUnits > 0 then
-                -- Sort ONLY resource units by distance
-                sortByDistance(resourceUnits)
-                targetUnit = resourceUnits[1]
-                
-                if DEBUG_MODE then
-                    local targetDefID = Spring.GetUnitDefID(targetUnit.id)
-                    local targetDef = targetDefID and UnitDefs[targetDefID]
-                    Spring.Echo("  -> ECO SELECTED: " .. (targetDef and targetDef.name or "unknown"))
-                    if #resourceUnits > 1 then
-                        Spring.Echo("     (chose closest of " .. #resourceUnits .. " resource units)")
-                    end
-                end
+        -- Separate units by groups for prioritization
+        local groupedUnits = {
+            energy_metal = {},
+            utils = {},
+            weapon = {},
+            aa = {},
+            builder = {},
+            others = {}
+        }
+        
+        -- Categorize all units by their groups
+        for _, unit in ipairs(units) do
+            if unit.unitGroup == "energy" or unit.unitGroup == "metal" then
+                table.insert(groupedUnits.energy_metal, unit)
+            elseif unit.unitGroup == "utils" then
+                table.insert(groupedUnits.utils, unit)
+            elseif unit.unitGroup == "weapon" then
+                table.insert(groupedUnits.weapon, unit)
+            elseif unit.unitGroup == "aa" then
+                table.insert(groupedUnits.aa, unit)
+            elseif unit.unitGroup == "builder" or unit.unitGroup == "buildert2" then
+                table.insert(groupedUnits.builder, unit)
             else
-                -- No resource units, sort other units by distance
-                if DEBUG_MODE then
-                    Spring.Echo("  -> No resource units, using closest other unit")
-                end
-                sortByDistance(otherUnits)
-                targetUnit = otherUnits[1]
+                table.insert(groupedUnits.others, unit)
             end
-        else
-            -- No eco priority, just sort all units by distance
-            sortByDistance(units)
-            targetUnit = units[1]
+        end
+        
+        -- Sort each group by distance
+        for _, group in pairs(groupedUnits) do
+            sortByDistance(group)
+        end
+        
+        if DEBUG_MODE then
+            local tierLabel = selectedTier == "ALL" and "all tiers" or ("T" .. selectedTier)
+            local ecoStatus = settings.ecoEnabled and "ECO ON" or "ECO OFF"
+            Spring.Echo("  Unit Groups in " .. tierLabel .. " [" .. ecoStatus .. "]:")
+            Spring.Echo("    Energy/Metal: " .. #groupedUnits.energy_metal)
+            Spring.Echo("    Utils: " .. #groupedUnits.utils)
+            Spring.Echo("    Weapons: " .. #groupedUnits.weapon)
+            Spring.Echo("    AA: " .. #groupedUnits.aa)
+            Spring.Echo("    Builders: " .. #groupedUnits.builder)
+            Spring.Echo("    Others: " .. #groupedUnits.others)
+        end
+        
+        -- Select target based on priority order
+        if settings.ecoEnabled then
+            -- ECO ON: energy/metal > utils > weapon > aa > builder > others
+            if #groupedUnits.energy_metal > 0 then
+                targetUnit = groupedUnits.energy_metal[1]
+                if DEBUG_MODE then
+                    Spring.Echo("  -> ECO PRIORITY: Selected " .. targetUnit.unitGroup .. " (highest priority)")
+                end
+            elseif #groupedUnits.utils > 0 then
+                targetUnit = groupedUnits.utils[1]
+                if DEBUG_MODE then
+                    Spring.Echo("  -> Selected utils (second priority)")
+                end
+            elseif #groupedUnits.weapon > 0 then
+                targetUnit = groupedUnits.weapon[1]
+                if DEBUG_MODE then
+                    Spring.Echo("  -> Selected weapon (third priority)")
+                end
+            elseif #groupedUnits.aa > 0 then
+                targetUnit = groupedUnits.aa[1]
+                if DEBUG_MODE then
+                    Spring.Echo("  -> Selected AA (fourth priority)")
+                end
+            elseif #groupedUnits.builder > 0 then
+                targetUnit = groupedUnits.builder[1]
+                if DEBUG_MODE then
+                    Spring.Echo("  -> Selected builder (fifth priority)")
+                end
+            elseif #groupedUnits.others > 0 then
+                targetUnit = groupedUnits.others[1]
+                if DEBUG_MODE then
+                    Spring.Echo("  -> Selected other (lowest priority)")
+                end
+            end
             
-            if DEBUG_MODE and #units > 1 then
-                local sameCategory = 0
-                for _, unit in ipairs(units) do
-                    if unit.category == targetUnit.category then
-                        sameCategory = sameCategory + 1
-                    end
+        else
+            -- ECO OFF: utils > weapon > aa > builder > energy/metal > others
+            if #groupedUnits.utils > 0 then
+                targetUnit = groupedUnits.utils[1]
+                if DEBUG_MODE then
+                    Spring.Echo("  -> Selected utils (highest priority without eco)")
                 end
-                if sameCategory > 1 then
-                    Spring.Echo("  -> Multiple units in same tier/category, choosing closest")
+            elseif #groupedUnits.weapon > 0 then
+                targetUnit = groupedUnits.weapon[1]
+                if DEBUG_MODE then
+                    Spring.Echo("  -> Selected weapon (second priority)")
                 end
+            elseif #groupedUnits.aa > 0 then
+                targetUnit = groupedUnits.aa[1]
+                if DEBUG_MODE then
+                    Spring.Echo("  -> Selected AA (third priority)")
+                end
+            elseif #groupedUnits.builder > 0 then
+                targetUnit = groupedUnits.builder[1]
+                if DEBUG_MODE then
+                    Spring.Echo("  -> Selected builder (fourth priority)")
+                end
+            elseif #groupedUnits.energy_metal > 0 then
+                targetUnit = groupedUnits.energy_metal[1]
+                if DEBUG_MODE then
+                    Spring.Echo("  -> Selected energy/metal (fifth priority without eco)")
+                end
+            elseif #groupedUnits.others > 0 then
+                targetUnit = groupedUnits.others[1]
+                if DEBUG_MODE then
+                    Spring.Echo("  -> Selected other (lowest priority)")
+                end
+            end
+        end
+        
+        if DEBUG_MODE and targetUnit then
+            local targetDefID = Spring.GetUnitDefID(targetUnit.id)
+            local targetDef = targetDefID and UnitDefs[targetDefID]
+            if targetDef then
+                Spring.Echo("    Target: " .. targetDef.name .. " (" .. targetUnit.unitGroup .. 
+                           ") at distance " .. math.floor(targetUnit.distance))
             end
         end
         
@@ -979,6 +1078,7 @@ local function findRepairTargets(turretID, settings)
                 if unitDefID then
                     local tier = getUnitTier(unitDefID)
                     local category = getUnitCategory(unitDefID)
+                    local unitGroup = getUnitGroup(unitDefID)
                     local ux, _, uz = Spring.GetUnitPosition(unitID)
                     if ux and uz then
                         local distance = Distance.exact(tx, tz, ux, uz)
@@ -992,7 +1092,7 @@ local function findRepairTargets(turretID, settings)
                                 local unitDef = UnitDefs[unitDefID]
                                 if unitDef then
                                     Spring.Echo("  Repair target: " .. unitDef.name .. 
-                                              " (T" .. tier .. ") " .. 
+                                              " (T" .. tier .. ", " .. unitGroup .. ") " .. 
                                               (isBuilt and "DAMAGED" or "CONSTRUCTING") ..
                                               " progress=" .. math.floor((buildProgress or 1) * 100) .. "%")
                                 end
@@ -1004,6 +1104,7 @@ local function findRepairTargets(turretID, settings)
                                 damage = 1 - (health / maxHealth),
                                 distance = distance,
                                 category = category,
+                                unitGroup = unitGroup,
                                 tier = tier,
                                 radius = radius,
                                 isBuilt = isBuilt,
@@ -1046,12 +1147,14 @@ local function findFeatureTargets(turretX, turretZ, buildRange, resurrectOnly, s
                             -- Get tier of original unit
                             local tier = getUnitTier(originalDef.id)
                             local category = getUnitCategory(originalDef.id)
+                            local unitGroup = getUnitGroup(originalDef.id)
                             
                             table.insert(tierFeatures[tier], {
                                 id = featureID,
                                 isFeature = true,
                                 tier = tier,
                                 category = category,
+                                unitGroup = unitGroup,
                                 distance = distance,
                                 value = (originalDef.metalCost or 0) * METAL_WEIGHT + 
                                        (originalDef.energyCost or 0) * ENERGY_WEIGHT,
@@ -1115,7 +1218,8 @@ local function calculateRepairPriority(settings)
                 local unitDef = UnitDefs[candidate.defID]
                 if unitDef and candidate.damage > 0.1 then
                     Spring.Echo("    HIGH PRIORITY REPAIR: " .. unitDef.name .. 
-                              " damage=" .. math.floor(candidate.damage * 100) .. "%")
+                              " (" .. (candidate.unitGroup or "other") .. ") damage=" .. 
+                              math.floor(candidate.damage * 100) .. "%")
                 end
             end
         else
@@ -1124,7 +1228,8 @@ local function calculateRepairPriority(settings)
                 local unitDef = UnitDefs[candidate.defID]
                 if unitDef then
                     Spring.Echo("    Low priority (constructing): " .. unitDef.name .. 
-                              " progress=" .. math.floor(candidate.buildProgress * 100) .. "%")
+                              " (" .. (candidate.unitGroup or "other") .. ") progress=" .. 
+                              math.floor(candidate.buildProgress * 100) .. "%")
                 end
             end
         end
@@ -1132,12 +1237,21 @@ local function calculateRepairPriority(settings)
         -- Primary: Tier (already filtered in findRepairTargets)
         -- Tier ordering is handled by the order candidates are added
         
-        -- Secondary: Eco priority within same tier
-        if settings.ecoEnabled and candidate.category == "resource" then
-            priority = priority - 100000  -- Strong eco preference
+        -- Secondary: Unit group priority
+        if candidate.unitGroup == "energy" or candidate.unitGroup == "metal" then
+            priority = priority - 100000  -- Highest group priority
+        elseif candidate.unitGroup == "utils" then
+            priority = priority - 50000
+        elseif candidate.unitGroup == "weapon" then
+            priority = priority - 20000
         end
         
-        -- Tertiary: Damage level (more damage = higher priority)
+        -- Tertiary: Eco priority (resource category)
+        if settings.ecoEnabled and candidate.category == "resource" then
+            priority = priority - 10000  -- Eco boost within group
+        end
+        
+        -- Quaternary: Damage level (more damage = higher priority)
         priority = priority - candidate.damage * 1000
         
         -- Distance is now handled separately as a strict tie-breaker
@@ -1153,12 +1267,23 @@ local function calculateReclaimPriority(settings)
         
         -- Primary: Tier (already ordered in findFeatureTargets)
         
-        -- Secondary: Eco priority
-        if settings.ecoEnabled and candidate.category == "resource" then
-            priority = priority - 100000  -- Strong eco preference
+        -- Secondary: Unit group priority (if resurrectible)
+        if candidate.unitGroup then
+            if candidate.unitGroup == "energy" or candidate.unitGroup == "metal" then
+                priority = priority - 100000  -- Highest group priority
+            elseif candidate.unitGroup == "utils" then
+                priority = priority - 50000
+            elseif candidate.unitGroup == "weapon" then
+                priority = priority - 20000
+            end
         end
         
-        -- Tertiary: Value
+        -- Tertiary: Eco priority
+        if settings.ecoEnabled and candidate.category == "resource" then
+            priority = priority - 10000  -- Eco boost
+        end
+        
+        -- Quaternary: Value
         priority = priority - candidate.value
         
         -- Distance is now handled separately as a strict tie-breaker
@@ -1174,12 +1299,23 @@ local function calculateResurrectPriority(settings)
         
         -- Primary: Tier (already ordered in findFeatureTargets)
         
-        -- Secondary: Eco priority
-        if settings.ecoEnabled and candidate.category == "resource" then
-            priority = priority - 100000  -- Strong eco preference
+        -- Secondary: Unit group priority
+        if candidate.unitGroup then
+            if candidate.unitGroup == "energy" or candidate.unitGroup == "metal" then
+                priority = priority - 100000  -- Highest group priority
+            elseif candidate.unitGroup == "utils" then
+                priority = priority - 50000
+            elseif candidate.unitGroup == "weapon" then
+                priority = priority - 20000
+            end
         end
         
-        -- Tertiary: Unit value
+        -- Tertiary: Eco priority
+        if settings.ecoEnabled and candidate.category == "resource" then
+            priority = priority - 10000  -- Eco boost
+        end
+        
+        -- Quaternary: Unit value
         priority = priority - candidate.value
         
         -- Distance is now handled separately as a strict tie-breaker
@@ -1193,9 +1329,11 @@ end
 -- MAIN PROCESSING
 --------------------------------------------------------------------------------
 
-local function processSingleTurret(turretID, settings, currentFrame)
+local function processSingleTurret(turretID, settings, currentFrame, forceProcess)
     -- If ALL options are OFF/disabled, don't touch the turret at all
-    if settings.mode == PRIORITY_MODES.OFF and 
+    -- BUT: Always process if forceProcess is true (from button clicks)
+    if not forceProcess and 
+       settings.mode == PRIORITY_MODES.OFF and 
        settings.tierFocus == "NONE" and 
        not settings.ecoEnabled then
         return  -- Widget completely hands off
@@ -1404,8 +1542,8 @@ local function processSingleTurret(turretID, settings, currentFrame)
             Spring.Echo("  -> Keeping current target and command")
         end
         
-        -- Show selection info when tier focus is active
-        if settings.tierFocus ~= "NONE" or DEBUG_MODE then
+        -- Show selection info when tier focus is active (only in debug mode)
+        if DEBUG_MODE and (settings.tierFocus ~= "NONE") then
             local targetDefID = Spring.GetUnitDefID(target)
             local targetName = "unknown"
             if targetDefID then
@@ -1423,7 +1561,7 @@ local function processSingleTurret(turretID, settings, currentFrame)
     end
 end
 
-local function processTurrets(specificTurrets)
+local function processTurrets(specificTurrets, forceProcess)
     local currentFrame = Spring.GetGameFrame()
     local toProcess = specificTurrets or {}
     
@@ -1446,7 +1584,7 @@ local function processTurrets(specificTurrets)
     -- Process each turret with its individual settings
     for _, turretID in ipairs(toProcess) do
         local settings = getTurretSettings(turretID)
-        processSingleTurret(turretID, settings, currentFrame)
+        processSingleTurret(turretID, settings, currentFrame, forceProcess)
     end
 end
 
@@ -1493,9 +1631,11 @@ for mode = 1, 4 do
         for _, turretID in ipairs(turrets) do
             local settings = getTurretSettings(turretID)
             settings.mode = mode
+            -- Force stop to trigger re-evaluation
+            forceStopTurret(turretID)
         end
         Spring.Echo("Turret Manager: " .. MODE_CONFIG[mode].message .. " for " .. #turrets .. " turret(s)")
-        processTurrets(turrets)
+        processTurrets(turrets, true)  -- Force process on button click
     end
 end
 
@@ -1504,10 +1644,14 @@ ACTION_HANDLERS.toggle_eco = function()
     for _, turretID in ipairs(turrets) do
         local settings = getTurretSettings(turretID)
         settings.ecoEnabled = not settings.ecoEnabled
+        -- Force stop to trigger re-evaluation (even when Action is OFF)
+        forceStopTurret(turretID)
+        -- Clear any manual override that might be blocking
+        manualOverrides[turretID] = nil
     end
     local state = getTurretSettings(turrets[1]).ecoEnabled
     Spring.Echo("Turret Manager: Eco " .. (state and "ON" or "OFF") .. " for " .. #turrets .. " turret(s)")
-    processTurrets(turrets)
+    processTurrets(turrets, true)  -- Force process on button click
 end
 
 ACTION_HANDLERS.toggle_tier = function()
@@ -1517,13 +1661,15 @@ ACTION_HANDLERS.toggle_tier = function()
     for _, turretID in ipairs(turrets) do
         local settings = getTurretSettings(turretID)
         settings.tierFocus = cycleValue(settings.tierFocus, tierValues)
+        -- Force stop to trigger re-evaluation
+        forceStopTurret(turretID)
     end
     
     local newFocus = getTurretSettings(turrets[1]).tierFocus
     local message = "Tier focus: " .. (newFocus == "NONE" and "disabled" or 
                     newFocus == "LOW" and "LowTier (T1→T4)" or "HighTier (T4→T1)")
     Spring.Echo("Turret Manager: " .. message .. " for " .. #turrets .. " turret(s)")
-    processTurrets(turrets)
+    processTurrets(turrets, true)  -- Force process on button click
 end
 
 --------------------------------------------------------------------------------
@@ -1565,8 +1711,9 @@ function widget:Initialize()
         end
     end
     
-    Spring.Echo("Turret Manager: Initialized with UNIVERSAL priority hierarchy")
-    Spring.Echo("  All modes follow: Action → Tier → Eco → Distance")
+    Spring.Echo("Turret Manager: Initialized with smart targeting system")
+    Spring.Echo("  ECO OFF: Action → Tier → Utils>Weapon>AA>Builder → Distance")
+    Spring.Echo("  ECO ON: Action → Tier → Energy/Metal>Utils>Weapon>AA>Builder → Distance")
     Spring.Echo("  Select turrets to see control buttons")
     Spring.Echo("  Each turret maintains its own settings")
     Spring.Echo("  Press Ctrl+Shift+D for debug mode")
@@ -1672,11 +1819,13 @@ function widget:CommandNotify(cmdID, cmdParams, cmdOptions)
         for _, turretID in ipairs(turrets) do
             local settings = getTurretSettings(turretID)
             settings.mode = (settings.mode + 1) % 5
+            -- Force stop to trigger re-evaluation
+            forceStopTurret(turretID)
         end
         
         local newMode = getTurretSettings(turrets[1]).mode
         Spring.Echo("Turret Manager: " .. MODE_CONFIG[newMode].display .. " for " .. #turrets .. " turret(s)")
-        processTurrets(turrets)
+        processTurrets(turrets, true)  -- Force process on button click
         return true
         
     elseif cmdID == CMD_ECO_PRIORITY then
@@ -1684,11 +1833,13 @@ function widget:CommandNotify(cmdID, cmdParams, cmdOptions)
         for _, turretID in ipairs(turrets) do
             local settings = getTurretSettings(turretID)
             settings.ecoEnabled = not settings.ecoEnabled
+            -- Force stop to trigger re-evaluation
+            forceStopTurret(turretID)
         end
         
         local state = getTurretSettings(turrets[1]).ecoEnabled
         Spring.Echo("Turret Manager: Eco " .. (state and "ON" or "OFF") .. " for " .. #turrets .. " turret(s)")
-        processTurrets(turrets)
+        processTurrets(turrets, true)  -- Force process on button click
         return true
         
     elseif cmdID == CMD_TIER_FOCUS then
@@ -1698,13 +1849,15 @@ function widget:CommandNotify(cmdID, cmdParams, cmdOptions)
         for _, turretID in ipairs(turrets) do
             local settings = getTurretSettings(turretID)
             settings.tierFocus = cycleValue(settings.tierFocus, tierValues)
+            -- Force stop to trigger re-evaluation
+            forceStopTurret(turretID)
         end
         
         local newFocus = getTurretSettings(turrets[1]).tierFocus
         local message = newFocus == "NONE" and "disabled" or 
                        newFocus == "LOW" and "LowTier" or "HighTier"
         Spring.Echo("Turret Manager: Tier " .. message .. " (value: '" .. newFocus .. "') for " .. #turrets .. " turret(s)")
-        processTurrets(turrets)
+        processTurrets(turrets, true)  -- Force process on button click
         return true
     end
     
@@ -1759,16 +1912,15 @@ function widget:DrawWorld()
     -- Draw indicators
     for turretID in pairs(watchedTurrets) do
         if Validate.isAlive(turretID) then
-            -- Show for selected turrets always, or all turrets in debug mode
-            if selectedTurrets[turretID] or DEBUG_MODE then
-                local settings = getTurretSettings(turretID)
-                
-                -- Show indicators if ANY setting is active (action, tier, or eco)
-                local hasActiveSettings = settings.mode ~= PRIORITY_MODES.OFF or 
-                                        settings.tierFocus ~= "NONE" or 
-                                        settings.ecoEnabled
-                
-                if hasActiveSettings then
+            local settings = getTurretSettings(turretID)
+            
+            -- Show indicators if ANY setting is active (action, tier, or eco)
+            local hasActiveSettings = settings.mode ~= PRIORITY_MODES.OFF or 
+                                    settings.tierFocus ~= "NONE" or 
+                                    settings.ecoEnabled
+            
+            -- Always show indicators for turrets with active settings
+            if hasActiveSettings then
                     local config = MODE_CONFIG[settings.mode]
                     local pos = Validate.getPosition(turretID)
                     if pos then
@@ -1789,48 +1941,38 @@ function widget:DrawWorld()
                             
                             if settings.tierFocus == "LOW" then
                                 gl.Color(0.9, 0.9, 0.2, 0.9)  -- Yellow for Low Tier
-                                -- Single lines radiating from 4 sides (from center)
+                                -- 8 lines evenly spread around a circle
                                 gl.BeginEnd(GL.LINES, function()
-                                    -- Top line
-                                    gl.Vertex(pos.x, pos.y, pos.z)
-                                    gl.Vertex(pos.x, pos.y, pos.z - 21)  -- Reduced from 35 to 21
-                                    -- Bottom line
-                                    gl.Vertex(pos.x, pos.y, pos.z)
-                                    gl.Vertex(pos.x, pos.y, pos.z + 21)  -- Reduced from 35 to 21
-                                    -- Left line
-                                    gl.Vertex(pos.x, pos.y, pos.z)
-                                    gl.Vertex(pos.x - 21, pos.y, pos.z)  -- Reduced from 35 to 21
-                                    -- Right line
-                                    gl.Vertex(pos.x, pos.y, pos.z)
-                                    gl.Vertex(pos.x + 21, pos.y, pos.z)  -- Reduced from 35 to 21
+                                    for i = 0, 7 do
+                                        local angle = math.rad(i * 45)  -- 8 lines = 360/8 = 45 degrees apart
+                                        local dx = math.cos(angle) * 21
+                                        local dz = math.sin(angle) * 21
+                                        gl.Vertex(pos.x, pos.y, pos.z)
+                                        gl.Vertex(pos.x + dx, pos.y, pos.z + dz)
+                                    end
                                 end)
                             else  -- HIGH
                                 gl.Color(0.9, 0.2, 0.2, 0.9)  -- Red for High Tier
-                                -- Double lines radiating from 4 sides (from center)
+                                -- 16 lines (double lines at 8 positions)
                                 gl.BeginEnd(GL.LINES, function()
-                                    -- Top double lines
-                                    gl.Vertex(pos.x - 1.5, pos.y, pos.z)
-                                    gl.Vertex(pos.x - 1.5, pos.y, pos.z - 21)  -- Reduced from 35 to 21
-                                    gl.Vertex(pos.x + 1.5, pos.y, pos.z)
-                                    gl.Vertex(pos.x + 1.5, pos.y, pos.z - 21)  -- Reduced from 35 to 21
-                                    
-                                    -- Bottom double lines
-                                    gl.Vertex(pos.x - 1.5, pos.y, pos.z)
-                                    gl.Vertex(pos.x - 1.5, pos.y, pos.z + 21)  -- Reduced from 35 to 21
-                                    gl.Vertex(pos.x + 1.5, pos.y, pos.z)
-                                    gl.Vertex(pos.x + 1.5, pos.y, pos.z + 21)  -- Reduced from 35 to 21
-                                    
-                                    -- Left double lines
-                                    gl.Vertex(pos.x, pos.y, pos.z - 1.5)
-                                    gl.Vertex(pos.x - 21, pos.y, pos.z - 1.5)  -- Reduced from 35 to 21
-                                    gl.Vertex(pos.x, pos.y, pos.z + 1.5)
-                                    gl.Vertex(pos.x - 21, pos.y, pos.z + 1.5)  -- Reduced from 35 to 21
-                                    
-                                    -- Right double lines
-                                    gl.Vertex(pos.x, pos.y, pos.z - 1.5)
-                                    gl.Vertex(pos.x + 21, pos.y, pos.z - 1.5)  -- Reduced from 35 to 21
-                                    gl.Vertex(pos.x, pos.y, pos.z + 1.5)
-                                    gl.Vertex(pos.x + 21, pos.y, pos.z + 1.5)  -- Reduced from 35 to 21
+                                    for i = 0, 7 do
+                                        local angle = math.rad(i * 45)  -- 8 positions = 45 degrees apart
+                                        -- Calculate perpendicular offset for double lines
+                                        local perpAngle = angle + math.rad(90)
+                                        local offsetX = math.cos(perpAngle) * 1.5
+                                        local offsetZ = math.sin(perpAngle) * 1.5
+                                        
+                                        local dx = math.cos(angle) * 21
+                                        local dz = math.sin(angle) * 21
+                                        
+                                        -- First line of the pair
+                                        gl.Vertex(pos.x + offsetX, pos.y, pos.z + offsetZ)
+                                        gl.Vertex(pos.x + offsetX + dx, pos.y, pos.z + offsetZ + dz)
+                                        
+                                        -- Second line of the pair
+                                        gl.Vertex(pos.x - offsetX, pos.y, pos.z - offsetZ)
+                                        gl.Vertex(pos.x - offsetX + dx, pos.y, pos.z - offsetZ + dz)
+                                    end
                                 end)
                             end
                         end
@@ -1842,7 +1984,6 @@ function widget:DrawWorld()
                             drawDashedCircle(pos.x, pos.y, pos.z, 20, 10, 5)  -- radius 20, 10° dash, 5° gap
                         end
                     end
-                end
             end
         end
     end
