@@ -207,6 +207,53 @@ local function getCurrentCommand(unitID)
     return nil, nil
 end
 
+-- Force clear all commands from turret
+local function forceStopTurret(turretID)
+    -- Validate turret ID first
+    if not turretID or not Spring.ValidUnitID(turretID) then
+        if DEBUG_MODE then
+            Spring.Echo("    WARNING: Invalid turret ID in forceStopTurret: " .. tostring(turretID))
+        end
+        return
+    end
+    
+    if DEBUG_MODE then
+        local commands = Spring.GetUnitCommands(turretID, -1)
+        if commands and #commands > 0 then
+            Spring.Echo("    Clearing " .. #commands .. " commands from turret " .. turretID)
+            for i, cmd in ipairs(commands) do
+                Spring.Echo("      Removing cmd[" .. i .. "]: " .. cmd.id .. " tag=" .. cmd.tag)
+            end
+        end
+    end
+    
+    -- First issue stop to interrupt current action
+    if CMD_STOP then
+        Spring.GiveOrderToUnit(turretID, CMD_STOP, {}, {})
+    else
+        if DEBUG_MODE then
+            Spring.Echo("    WARNING: CMD_STOP is nil!")
+        end
+    end
+    
+    -- Then remove all queued commands (if CMD_REMOVE is available)
+    if CMD_REMOVE and CMD_REMOVE > 0 then
+        local commands = Spring.GetUnitCommands(turretID, -1)
+        if commands and #commands > 0 then
+            -- Remove in reverse order (newest first)
+            for i = #commands, 1, -1 do
+                -- Use the format from holo_place: tag directly, not in table
+                Spring.GiveOrderToUnit(turretID, CMD_REMOVE, commands[i].tag, 0)
+            end
+        end
+    end
+    
+    -- Issue stop again to be sure
+    if CMD_STOP then
+        Spring.GiveOrderToUnit(turretID, CMD_STOP, {}, {})
+    end
+end
+
 -- Check if unit is guarding an active target
 local function isGuardingActiveUnit(unitID)
     local cmd, targetID = getCurrentCommand(unitID)
@@ -223,6 +270,7 @@ local function sortByDistance(units)
     return units
 end
 
+
 -- Draw dashed circle at position
 local function drawDashedCircle(x, y, z, radius, dashDegrees, gapDegrees)
     gl.BeginEnd(GL.LINES, function()
@@ -234,6 +282,58 @@ local function drawDashedCircle(x, y, z, radius, dashDegrees, gapDegrees)
             gl.Vertex(x + math.cos(angle2) * radius, y, z + math.sin(angle2) * radius)
         end
     end)
+end
+
+
+-- Group candidates by priority level (for strict tie-breaking)
+local function groupByPriority(candidates, priorityCalc)
+    local groups = {}
+    local priorityMap = {}
+    
+    -- Calculate priorities and group candidates
+    for _, candidate in ipairs(candidates) do
+        local priority = priorityCalc(candidate, 0)  -- Pass 0 for distance to exclude it
+        
+        if not priorityMap[priority] then
+            priorityMap[priority] = {}
+            table.insert(groups, {priority = priority, candidates = priorityMap[priority]})
+        end
+        
+        -- Store candidate with its actual distance for later sorting
+        table.insert(priorityMap[priority], candidate)
+    end
+    
+    -- Sort groups by priority (lowest priority value = highest priority)
+    table.sort(groups, function(a, b) return a.priority < b.priority end)
+    
+    -- Within each group, sort by distance
+    for _, group in ipairs(groups) do
+        sortByDistance(group.candidates)
+        
+        -- Debug output for priority grouping
+        if DEBUG_MODE and #group.candidates > 1 then
+            Spring.Echo("    Priority group " .. math.floor(group.priority) .. " has " .. 
+                       #group.candidates .. " candidates - using distance as tie-breaker")
+            for i, candidate in ipairs(group.candidates) do
+                if i <= 3 then  -- Show first 3
+                    local id = candidate.id
+                    local dist = math.floor(candidate.distance or 0)
+                    if candidate.defID then
+                        local unitDef = UnitDefs[candidate.defID]
+                        if unitDef then
+                            Spring.Echo("      [" .. i .. "] " .. unitDef.name .. " at distance " .. dist)
+                        end
+                    elseif candidate.isFeature then
+                        Spring.Echo("      [" .. i .. "] Feature at distance " .. dist)
+                    else
+                        Spring.Echo("      [" .. i .. "] Target at distance " .. dist)
+                    end
+                end
+            end
+        end
+    end
+    
+    return groups
 end
 
 --------------------------------------------------------------------------------
@@ -259,20 +359,26 @@ local CATEGORY_WEIGHTS = {
 }
 
 -- Debug mode
-local DEBUG_MODE = true
+local DEBUG_MODE = false
 
 --------------------------------------------------------------------------------
 -- COMMAND DEFINITIONS
 --------------------------------------------------------------------------------
 
 -- Spring Command Constants (REQUIRED!)
-local CMD_STOP = CMD.STOP
-local CMD_REPAIR = CMD.REPAIR
-local CMD_RECLAIM = CMD.RECLAIM
-local CMD_RESURRECT = CMD.RESURRECT
-local CMD_GUARD = CMD.GUARD
-local CMD_MOVE = CMD.MOVE
-local CMD_BUILD = CMD.BUILD
+local CMD_STOP = CMD.STOP or 0
+local CMD_REPAIR = CMD.REPAIR or 40
+local CMD_RECLAIM = CMD.RECLAIM or 90
+local CMD_RESURRECT = CMD.RESURRECT or 125
+local CMD_GUARD = CMD.GUARD or 25
+local CMD_MOVE = CMD.MOVE or 10
+local CMD_BUILD = CMD.BUILD 
+local CMD_INSERT = CMD.INSERT or 1
+local CMD_REMOVE = CMD.REMOVE or 2
+
+-- Command type constants (required for custom buttons)
+local CMDTYPE = CMDTYPE or {}
+CMDTYPE.ICON_MODE = 5  -- For mode buttons with multiple states
 
 -- Custom Command IDs
 local CMD_SMART_MODE = 28370
@@ -587,11 +693,11 @@ end
 -- DRY TARGET FINDING SYSTEM
 --------------------------------------------------------------------------------
 
--- Generic target finder (DRY pattern)
+-- Generic target finder (DRY pattern) - now with strict priority grouping
 local function findBestTargetGeneric(turretID, turretX, turretZ, buildRange, candidateGetter, priorityCalc)
-    local bestTarget = nil
-    local bestPriority = math.huge
+    local validCandidates = {}
     
+    -- First, filter candidates by range and collect valid ones with distances
     for _, candidate in ipairs(candidateGetter()) do
         local pos = candidate.pos or Validate.getPosition(candidate.id, candidate.isFeature)
         
@@ -600,16 +706,34 @@ local function findBestTargetGeneric(turretID, turretX, turretZ, buildRange, can
             local radius = candidate.radius or 8
             
             if dist <= buildRange + radius + RANGE_BUFFER then
-                local priority = priorityCalc(candidate, dist)
-                if priority < bestPriority then
-                    bestTarget = candidate.id
-                    bestPriority = priority
-                end
+                candidate.distance = dist  -- Store distance for later use
+                table.insert(validCandidates, candidate)
             end
         end
     end
     
-    return bestTarget
+    -- If no valid candidates, return nil
+    if #validCandidates == 0 then
+        return nil
+    end
+    
+    -- Group candidates by priority level
+    local priorityGroups = groupByPriority(validCandidates, priorityCalc)
+    
+    -- Select from the highest priority group (first group after sorting)
+    if #priorityGroups > 0 and #priorityGroups[1].candidates > 0 then
+        local bestCandidate = priorityGroups[1].candidates[1]  -- Already sorted by distance
+        
+        if DEBUG_MODE and #priorityGroups[1].candidates > 1 then
+            Spring.Echo("  -> Multiple targets with same priority, choosing closest: " .. 
+                       #priorityGroups[1].candidates .. " candidates at priority " .. 
+                       math.floor(priorityGroups[1].priority))
+        end
+        
+        return bestCandidate.id
+    end
+    
+    return nil
 end
 
 -- Build target finder - Universal hierarchy: tier→eco→distance
@@ -637,7 +761,7 @@ local function findBuildTargets(turretID, settings)
         if Spring.GetUnitTeam(unitID) == myTeamID then
             local _, _, _, _, buildProgress = Spring.GetUnitHealth(unitID)
             
-            if buildProgress and buildProgress > 0.01 and buildProgress < 0.99 then
+            if buildProgress and buildProgress > 0.01 and buildProgress < 1.0 then
                 local unitDefID = Spring.GetUnitDefID(unitID)
                 if unitDefID then
                     local tier = getUnitTier(unitDefID)
@@ -686,14 +810,33 @@ local function findBuildTargets(turretID, settings)
     if DEBUG_MODE and settings.tierFocus ~= "NONE" then
         Spring.Echo((settings.tierFocus == "LOW" and "LowTier" or "HighTier") .. 
                    " mode: T1=" .. #tierUnits[1] .. " T2=" .. #tierUnits[2] .. 
-                   " T3=" .. #tierUnits[3] .. " T4=" .. #tierUnits[4])
+                   " T3=" .. #tierUnits[3] .. " T4=" .. #tierUnits[4] .. 
+                   " -> Selected tier: " .. tostring(selectedTier))
+        
+        -- Show what's in each tier
+        for tier = 1, 4 do
+            if #tierUnits[tier] > 0 then
+                Spring.Echo("  Tier " .. tier .. " units:")
+                for i, unit in ipairs(tierUnits[tier]) do
+                    local unitDefID = Spring.GetUnitDefID(unit.id)
+                    local unitDef = unitDefID and UnitDefs[unitDefID]
+                    if unitDef and i <= 3 then  -- Show first 3
+                        Spring.Echo("    - " .. unitDef.name .. " (progress: " .. 
+                                   math.floor(unit.progress * 100) .. "%, dist: " .. 
+                                   math.floor(unit.distance) .. ")")
+                    end
+                end
+            end
+        end
+        
         if currentTarget then
             local currentDefID = Spring.GetUnitDefID(currentTarget)
             if currentDefID then
                 local currentTier = getUnitTier(currentDefID)
                 local currentDef = UnitDefs[currentDefID]
                 if currentDef then
-                    Spring.Echo("  Current target: " .. currentDef.name .. " (T" .. currentTier .. ")")
+                    Spring.Echo("  Current target: " .. currentDef.name .. " (T" .. currentTier .. 
+                               ") ID=" .. currentTarget)
                 end
             end
         end
@@ -719,7 +862,9 @@ local function findBuildTargets(turretID, settings)
     -- If we have units to choose from
     if #units > 0 then
         
-        -- Apply ECO priority if enabled
+        -- Apply strict priority grouping: Tier → Eco → Distance
+        local targetUnit = nil
+        
         if settings.ecoEnabled then
             -- Separate resource and non-resource units
             local resourceUnits = {}
@@ -758,37 +903,57 @@ local function findBuildTargets(turretID, settings)
             
             -- Prioritize resource units if any exist
             if #resourceUnits > 0 then
+                -- Sort ONLY resource units by distance
                 sortByDistance(resourceUnits)
+                targetUnit = resourceUnits[1]
+                
                 if DEBUG_MODE then
-                    local targetDefID = Spring.GetUnitDefID(resourceUnits[1].id)
+                    local targetDefID = Spring.GetUnitDefID(targetUnit.id)
                     local targetDef = targetDefID and UnitDefs[targetDefID]
                     Spring.Echo("  -> ECO SELECTED: " .. (targetDef and targetDef.name or "unknown"))
+                    if #resourceUnits > 1 then
+                        Spring.Echo("     (chose closest of " .. #resourceUnits .. " resource units)")
+                    end
                 end
-                return resourceUnits[1].id
             else
+                -- No resource units, sort other units by distance
                 if DEBUG_MODE then
                     Spring.Echo("  -> No resource units, using closest other unit")
                 end
-                units = otherUnits
+                sortByDistance(otherUnits)
+                targetUnit = otherUnits[1]
+            end
+        else
+            -- No eco priority, just sort all units by distance
+            sortByDistance(units)
+            targetUnit = units[1]
+            
+            if DEBUG_MODE and #units > 1 then
+                local sameCategory = 0
+                for _, unit in ipairs(units) do
+                    if unit.category == targetUnit.category then
+                        sameCategory = sameCategory + 1
+                    end
+                end
+                if sameCategory > 1 then
+                    Spring.Echo("  -> Multiple units in same tier/category, choosing closest")
+                end
             end
         end
         
-        -- Sort by distance (closest first)
-        sortByDistance(units)
-        
-        if DEBUG_MODE then
+        if DEBUG_MODE and targetUnit then
             local ecoStatus = settings.ecoEnabled and "[ECO ON]" or "[ECO OFF]"
             local tierLabel = selectedTier == "ALL" and "unit from all tiers" or ("T" .. selectedTier .. " unit")
             Spring.Echo("Selected " .. tierLabel .. " " .. ecoStatus .. " (out of " .. 
                        #tierUnits[1] .. " T1, " .. #tierUnits[2] .. " T2, " ..
                        #tierUnits[3] .. " T3, " .. #tierUnits[4] .. " T4)")
-            local targetDefID = Spring.GetUnitDefID(units[1].id)
+            local targetDefID = Spring.GetUnitDefID(targetUnit.id)
             if targetDefID and UnitDefs[targetDefID] then
                 Spring.Echo("  -> Target: " .. UnitDefs[targetDefID].name)
             end
         end
         
-        return units[1].id
+        return targetUnit and targetUnit.id or nil
     end
     
     return nil
@@ -975,8 +1140,8 @@ local function calculateRepairPriority(settings)
         -- Tertiary: Damage level (more damage = higher priority)
         priority = priority - candidate.damage * 1000
         
-        -- Final: Distance as tiebreaker
-        priority = priority + distance / 10
+        -- Distance is now handled separately as a strict tie-breaker
+        -- No longer adding distance to priority calculation
         
         return priority
     end
@@ -996,8 +1161,8 @@ local function calculateReclaimPriority(settings)
         -- Tertiary: Value
         priority = priority - candidate.value
         
-        -- Final: Distance as tiebreaker
-        priority = priority + distance / 10
+        -- Distance is now handled separately as a strict tie-breaker
+        -- No longer adding distance to priority calculation
         
         return priority
     end
@@ -1017,8 +1182,8 @@ local function calculateResurrectPriority(settings)
         -- Tertiary: Unit value
         priority = priority - candidate.value
         
-        -- Final: Distance as tiebreaker
-        priority = priority + distance / 10
+        -- Distance is now handled separately as a strict tie-breaker
+        -- No longer adding distance to priority calculation
         
         return priority
     end
@@ -1140,35 +1305,103 @@ local function processSingleTurret(turretID, settings, currentFrame)
     
     -- Issue command or stop
     if target then
-        -- Check if we need to switch targets
+        -- Check current command (could be REPAIR, RECLAIM, or RESURRECT)
         local currentCmd, currentTarget = getCurrentCommand(turretID)
+        local currentCmdID = currentCmd and currentCmd.id or nil
         
-        if DEBUG_MODE and currentTarget then
-            local currentDefID = Spring.GetUnitDefID(currentTarget)
-            local targetDefID = Spring.GetUnitDefID(target)
-            if currentDefID and targetDefID then
-                local currentDef = UnitDefs[currentDefID]
-                local targetDef = UnitDefs[targetDefID]
-                if currentDef and targetDef then
-                    local currentTier = getUnitTier(currentDefID)
-                    local targetTier = getUnitTier(targetDefID)
-                    if currentTarget ~= target then
-                        Spring.Echo("SWITCHING: " .. currentDef.name .. " (T" .. currentTier .. 
-                                   ") -> " .. targetDef.name .. " (T" .. targetTier .. ")")
-                    elseif settings.tierFocus ~= "NONE" then
-                        Spring.Echo("KEEPING: " .. currentDef.name .. " (T" .. currentTier .. 
-                                   ") [best option: " .. targetDef.name .. " T" .. targetTier .. "]")
+        -- For turrets, valid commands are REPAIR, RECLAIM, RESURRECT
+        if currentCmd and (currentCmd.id == CMD.REPAIR or 
+                           currentCmd.id == CMD.RECLAIM or 
+                           currentCmd.id == CMD.RESURRECT) then
+            currentTarget = currentCmd.params and currentCmd.params[1] or nil
+        else
+            currentTarget = nil
+            currentCmdID = nil
+        end
+        
+        if DEBUG_MODE then
+            Spring.Echo("  -> Current command: " .. (currentCmdID or "none") .. 
+                        " target: " .. tostring(currentTarget))
+        end
+        
+        if DEBUG_MODE then
+            Spring.Echo("  -> Comparing IDs: current=" .. tostring(currentTarget) .. 
+                       " vs new=" .. tostring(target) .. " (equal=" .. tostring(currentTarget == target) .. ")")
+            
+            if currentTarget then
+                local currentDefID = Spring.GetUnitDefID(currentTarget)
+                local targetDefID = Spring.GetUnitDefID(target)
+                if currentDefID and targetDefID then
+                    local currentDef = UnitDefs[currentDefID]
+                    local targetDef = UnitDefs[targetDefID]
+                    if currentDef and targetDef then
+                        local currentTier = getUnitTier(currentDefID)
+                        local targetTier = getUnitTier(targetDefID)
+                        if currentTarget ~= target then
+                            Spring.Echo("SWITCHING: " .. currentDef.name .. " (T" .. currentTier .. 
+                                       ") ID=" .. currentTarget .. " -> " .. targetDef.name .. 
+                                       " (T" .. targetTier .. ") ID=" .. target)
+                        else
+                            Spring.Echo("KEEPING: " .. currentDef.name .. " (T" .. currentTier .. 
+                                       ") ID=" .. currentTarget .. " [same as selected]")
+                        end
                     end
+                else
+                    Spring.Echo("     Warning: Could not get unit defs for comparison")
                 end
+            else
+                Spring.Echo("     No current target (turret idle or non-repair command)")
             end
         end
         
-        -- Only issue new command if target changed
-        if currentTarget ~= target then
-            -- Stop current action first to ensure clean switch
-            Spring.GiveOrderToUnit(turretID, CMD_STOP, {}, {})
-            -- Issue new command
-            Spring.GiveOrderToUnit(turretID, cmdID, {target}, {})
+        -- Check if we need to switch (different target OR different command type)
+        local needSwitch = false
+        
+        if not currentTarget then
+            -- No current target, definitely need to set one
+            needSwitch = true
+        elseif currentTarget ~= target then
+            -- Different target
+            needSwitch = true
+        elseif currentCmdID ~= cmdID then
+            -- Same target but different command type (e.g., switching from REPAIR to RECLAIM)
+            needSwitch = true
+            if DEBUG_MODE then
+                Spring.Echo("  -> Command type change: " .. currentCmdID .. " -> " .. cmdID)
+            end
+        end
+        
+        if needSwitch then
+            -- Force stop all current actions
+            forceStopTurret(turretID)
+            
+            -- Use INSERT to put new command at front of queue (like auto_repair does)
+            -- Format: {position, commandID, options, params...}
+            -- Position 0 = front of queue, options 0 = no modifiers
+            Spring.GiveOrderToUnit(turretID, CMD_INSERT, {0, cmdID, 0, target}, {"alt"})
+            
+            if DEBUG_MODE then
+                local action = cmdID == CMD.REPAIR and "REPAIR" or
+                               cmdID == CMD.RECLAIM and "RECLAIM" or
+                               cmdID == CMD.RESURRECT and "RESURRECT" or "UNKNOWN"
+                Spring.Echo("  -> Switched to " .. action .. " target " .. tostring(target) .. 
+                            " (was: " .. tostring(currentTarget) .. ")")
+                
+                -- Verify the command was accepted
+                local newCmd, newTarget = getCurrentCommand(turretID)
+                if newCmd then
+                    Spring.Echo("    Verification: New command is " .. newCmd.id .. 
+                               " targeting " .. tostring(newCmd.params and newCmd.params[1] or "nil"))
+                    if newCmd.params and newCmd.params[1] ~= target then
+                        Spring.Echo("    WARNING: Command didn't stick! Expected " .. target .. 
+                                   " but got " .. tostring(newCmd.params[1]))
+                    end
+                else
+                    Spring.Echo("    WARNING: No command after switch!")
+                end
+            end
+        elseif DEBUG_MODE then
+            Spring.Echo("  -> Keeping current target and command")
         end
         
         -- Show selection info when tier focus is active
@@ -1186,7 +1419,7 @@ local function processSingleTurret(turretID, settings, currentFrame)
                        " + " .. settings.tierFocus .. " tier] selected: " .. targetName)
         end
     else
-        Spring.GiveOrderToUnit(turretID, CMD.STOP, {}, {})
+        Spring.GiveOrderToUnit(turretID, CMD_STOP, {}, {})
     end
 end
 
@@ -1310,7 +1543,6 @@ function widget:Initialize()
         
         -- ECO Priority button labels
         i18n.set("en.ui.orderMenu.Eco Focus", "Eco Focus")
-        i18n.set("en.ui.orderMenu.Eco Focus", "Eco Focus")
         
         -- Tier Focus button labels
         i18n.set("en.ui.orderMenu.Tier Focus", "Tier Focus")
@@ -1338,6 +1570,16 @@ function widget:Initialize()
     Spring.Echo("  Select turrets to see control buttons")
     Spring.Echo("  Each turret maintains its own settings")
     Spring.Echo("  Press Ctrl+Shift+D for debug mode")
+    
+    if DEBUG_MODE then
+        Spring.Echo("  Command constant values:")
+        Spring.Echo("    CMD_STOP = " .. tostring(CMD_STOP) .. " (should be 0)")
+        Spring.Echo("    CMD_REPAIR = " .. tostring(CMD_REPAIR) .. " (should be 40)")
+        Spring.Echo("    CMD_RECLAIM = " .. tostring(CMD_RECLAIM) .. " (should be 90)")
+        Spring.Echo("    CMD_RESURRECT = " .. tostring(CMD_RESURRECT) .. " (should be 125)")
+        Spring.Echo("    CMD_INSERT = " .. tostring(CMD_INSERT) .. " (should be 1)")
+        Spring.Echo("    CMD_REMOVE = " .. tostring(CMD_REMOVE) .. " (should be 2)")
+    end
     
     -- Find existing turrets
     local myTeamID = Spring.GetMyTeamID()
@@ -1407,9 +1649,21 @@ function widget:CommandsChanged()
     cmds[#cmds + 1] = CMD_SMART_MODE_DESC
     cmds[#cmds + 1] = CMD_ECO_PRIORITY_DESC
     cmds[#cmds + 1] = CMD_TIER_FOCUS_DESC
+    
+    if DEBUG_MODE then
+        Spring.Echo("Added turret buttons - Smart Mode ID: " .. CMD_SMART_MODE_DESC.id .. 
+                   ", Eco ID: " .. CMD_ECO_PRIORITY_DESC.id .. 
+                   ", Tier ID: " .. CMD_TIER_FOCUS_DESC.id)
+    end
 end
 
 function widget:CommandNotify(cmdID, cmdParams, cmdOptions)
+    if DEBUG_MODE then
+        Spring.Echo("CommandNotify called with cmdID: " .. tostring(cmdID) .. 
+                   " (SMART=" .. CMD_SMART_MODE .. ", ECO=" .. CMD_ECO_PRIORITY .. 
+                   ", TIER=" .. CMD_TIER_FOCUS .. ")")
+    end
+    
     local turrets = filterTurrets(Spring.GetSelectedUnits())
     if #turrets == 0 then return false end
     
@@ -1508,14 +1762,14 @@ function widget:DrawWorld()
             -- Show for selected turrets always, or all turrets in debug mode
             if selectedTurrets[turretID] or DEBUG_MODE then
                 local settings = getTurretSettings(turretID)
-                local config = MODE_CONFIG[settings.mode]
                 
                 -- Show indicators if ANY setting is active (action, tier, or eco)
-                local shouldDraw = settings.mode ~= PRIORITY_MODES.OFF or 
-                                 settings.tierFocus ~= "NONE" or 
-                                 settings.ecoEnabled
+                local hasActiveSettings = settings.mode ~= PRIORITY_MODES.OFF or 
+                                        settings.tierFocus ~= "NONE" or 
+                                        settings.ecoEnabled
                 
-                if shouldDraw then
+                if hasActiveSettings then
+                    local config = MODE_CONFIG[settings.mode]
                     local pos = Validate.getPosition(turretID)
                     if pos then
                         -- Calculate line width scaling based on camera distance
