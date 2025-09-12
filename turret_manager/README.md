@@ -225,7 +225,7 @@ GNU General Public License v2.0 or later - see [LICENSE](LICENSE) for details.
 
 - [Beyond All Reason](https://www.beyondallreason.info/) development team
 - Original widget by augustin
-- Enhanced by Waleed via Claude Code
+- Redesigned by Pyrem
 - BAR community for testing and feedback
 
 ## 📞 Support
