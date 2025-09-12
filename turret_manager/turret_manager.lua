@@ -63,7 +63,7 @@ Task Priority:
 
 function widget:GetInfo()
     return {
-        name = "🎯 Turret Manager",
+        name = "🎯 Turret Manager (Pyrem)",
         desc = "Intelligent nano turret automation with tier control and visual feedback",
         author = "augustin, enhanced by Waleed via Claude Code",
         date = "2025-01-12",
