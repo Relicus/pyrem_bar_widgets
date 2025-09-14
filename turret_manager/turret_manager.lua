@@ -5,7 +5,26 @@
 
 Originally created by augustin - Redesigned and enhanced by Pyrem
 
+📝 CHANGELOG:
+v1.3.0 (2025-01-13):
+• Dynamic nano turret detection using unit capabilities
+• Capability-aware UI - only shows actions turrets can perform
+• Supports ALL nano turret variants (T1/T2/T3 + respawn units)
+• Fixed button showing unavailable actions
+
+v1.2.0 (2025-01-12):
+• Initial capability detection system
+• Version numbering realignment
+
+v1.1.0 (2025-01-12):
+• DRY code architecture with 8 reusable helper functions
+• Visual indicators refined (40% smaller)
+• Camera zoom-aware line scaling
+
 📋 FEATURES:
+• Dynamic nano turret detection using unit capabilities (Builder, StaticBuilder, Immobile)
+• Capability-aware actions - only shows actions the turret can perform
+• Dynamic button UI - adjusts options based on turret capabilities (no Reclaim/Resurrect if not supported)
 • Individual per-turret settings with visual indicators
 • Smart guard handling - helps when needed, works independently when idle
 • Dynamic task switching based on priority system
@@ -54,11 +73,14 @@ Task Priority:
 • Line thickness automatically scales with camera zoom for consistency
 
 🔧 TECHNICAL IMPROVEMENTS:
+• Capability-based detection for reliable nano turret discovery
+• Dynamic button generation based on unit capabilities
+• Smart mode-to-button index mapping for proper UI interaction
 • DRY architecture with 8 reusable helper functions
 • Optimized tier selection and filtering logic
 • Centralized command checking and validation
 • Performance-optimized distance calculations
-• ~100 lines of duplicate code eliminated
+• Future-proof design - automatically detects new nano variants
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 --]]
@@ -68,8 +90,8 @@ function widget:GetInfo()
         name = "🎯 Turret Manager (Pyrem)",
         desc = "Intelligent nano turret automation with tier control and visual feedback",
         author = "augustin, redesigned by Pyrem",
-        date = "2025-01-12",
-        version = "1.0.0",
+        date = "2025-01-13",
+        version = "1.3.0",
         layer = 10,
         enabled = true,
         handler = true,
@@ -477,6 +499,7 @@ local DEFAULT_SETTINGS = {
 
 -- Dynamic data structures
 local turretDefIDs = {}        -- Construction turret definitions
+local turretCapabilities = {}  -- Turret capability cache (repair, reclaim, resurrect)
 local UNIT_TIERS = {}          -- Tier classification cache
 local UNIT_CATEGORIES = {}     -- Category classification cache
 local UNIT_GROUPS = {}         -- Unit group cache from customParams
@@ -485,6 +508,7 @@ local UNIT_GROUPS = {}         -- Unit group cache from customParams
 local watchedTurrets = {}      -- Active turret tracking
 local manualOverrides = {}     -- Manual command tracking
 local constructionTracking = {} -- Decay prevention tracking
+local buttonModeMapping = {}   -- Maps button indices to actual mode values
 
 -- Throttled update functions
 local updateTurrets = Throttle.create(UPDATE_FRAMES)
@@ -525,6 +549,125 @@ local function cycleValue(current, values)
         end
     end
     return values[1]
+end
+
+-- Get available modes for a turret based on its capabilities
+local function getAvailableModesForTurret(turretID)
+    local defID = Spring.GetUnitDefID(turretID)
+    if not defID or not turretCapabilities[defID] then
+        -- Default to all modes if capabilities unknown
+        return {0, 1, 2, 3, 4}  -- OFF, BUILD, REPAIR, RECLAIM, RESURRECT
+    end
+    
+    local caps = turretCapabilities[defID]
+    local modes = {0, 1, 2}  -- OFF, BUILD, REPAIR always available
+    
+    if caps.canReclaim then
+        table.insert(modes, 3)  -- RECLAIM
+    end
+    
+    if caps.canResurrect then
+        table.insert(modes, 4)  -- RESURRECT
+    end
+    
+    return modes
+end
+
+-- Cycle to next available mode for turret
+local function cycleToNextAvailableMode(turretID, currentMode)
+    local availableModes = getAvailableModesForTurret(turretID)
+    
+    -- Find current mode index
+    local currentIndex = 1
+    for i, mode in ipairs(availableModes) do
+        if mode == currentMode then
+            currentIndex = i
+            break
+        end
+    end
+    
+    -- Cycle to next available mode
+    local nextIndex = (currentIndex % #availableModes) + 1
+    return availableModes[nextIndex]
+end
+
+-- Get mode names for tooltip based on turret capabilities
+local function getModesTooltipForTurret(turretID)
+    local defID = Spring.GetUnitDefID(turretID)
+    if not defID or not turretCapabilities[defID] then
+        return "Priority mode: OFF → Build → Repair → Reclaim → Resurrect"
+    end
+    
+    local caps = turretCapabilities[defID]
+    local modes = {"OFF", "Build", "Repair"}
+    
+    if caps.canReclaim then
+        table.insert(modes, "Reclaim")
+    end
+    
+    if caps.canResurrect then
+        table.insert(modes, "Resurrect")
+    end
+    
+    return "Priority mode: " .. table.concat(modes, " → ")
+end
+
+-- Build dynamic button params based on turret capabilities
+-- Returns: params array, mode-to-button-index mapping, button-index-to-mode mapping
+local function buildButtonParamsForTurret(turretID, currentMode)
+    local defID = Spring.GetUnitDefID(turretID)
+    if not defID or not turretCapabilities[defID] then
+        -- Default to all modes if capabilities unknown
+        return {currentMode or 0, "Action Focus", "Build", "Repair", "Reclaim", "Resurrect"}, nil, nil
+    end
+    
+    local caps = turretCapabilities[defID]
+    local params = {}
+    local modeToButton = {}  -- Maps PRIORITY_MODES value to button index
+    local buttonToMode = {}  -- Maps button index to PRIORITY_MODES value
+    local buttonIndex = 0
+    
+    -- Always include OFF, BUILD, REPAIR
+    params[1] = 0  -- Will be updated with mapped current mode
+    params[2] = "Action Focus"  -- OFF
+    modeToButton[PRIORITY_MODES.OFF] = 0
+    buttonToMode[0] = PRIORITY_MODES.OFF
+    
+    params[3] = "Build"
+    modeToButton[PRIORITY_MODES.BUILD] = 1
+    buttonToMode[1] = PRIORITY_MODES.BUILD
+    
+    params[4] = "Repair"
+    modeToButton[PRIORITY_MODES.REPAIR] = 2
+    buttonToMode[2] = PRIORITY_MODES.REPAIR
+    
+    buttonIndex = 2
+    
+    -- Add RECLAIM if capable
+    if caps.canReclaim then
+        buttonIndex = buttonIndex + 1
+        params[buttonIndex + 2] = "Reclaim"
+        modeToButton[PRIORITY_MODES.RECLAIM] = buttonIndex
+        buttonToMode[buttonIndex] = PRIORITY_MODES.RECLAIM
+    end
+    
+    -- Add RESURRECT if capable
+    if caps.canResurrect then
+        buttonIndex = buttonIndex + 1
+        params[buttonIndex + 2] = "Resurrect"
+        modeToButton[PRIORITY_MODES.RESURRECT] = buttonIndex
+        buttonToMode[buttonIndex] = PRIORITY_MODES.RESURRECT
+    end
+    
+    -- Map current mode to button index
+    params[1] = modeToButton[currentMode] or 0
+    
+    if DEBUG_MODE then
+        Spring.Echo("  Button params for turret: " .. table.concat(params, ", ", 2))
+        Spring.Echo("  Current mode " .. (currentMode or 0) .. " maps to button index " .. params[1])
+    end
+    
+    return params, modeToButton, buttonToMode
 end
 
 --------------------------------------------------------------------------------
@@ -706,28 +849,37 @@ end
 
 local function discoverConstructionTurrets()
     turretDefIDs = {}
+    turretCapabilities = {}
     
-    -- Known turret names
-    local knownNames = {"armnanotc", "cornanotc", "legnanotc", "armnanotcplat", "cornanotcplat"}
-    for _, name in ipairs(knownNames) do
-        local unitDef = UnitDefNames[name]
-        if unitDef then
-            turretDefIDs[unitDef.id] = true
-        end
-    end
-    
-    -- Dynamic discovery
+    -- Dynamic discovery using unit capabilities (more reliable than name matching)
     for unitDefID, unitDef in pairs(UnitDefs) do
-        if unitDef and unitDef.isBuilding and not unitDef.canMove and
-           unitDef.buildOptions and #unitDef.buildOptions > 0 and
-           unitDef.buildDistance and unitDef.buildDistance > 0 then
+        -- Nano turrets are defined by being:
+        -- 1. Builders (can build/repair)
+        -- 2. Static builders (immobile builders)
+        -- 3. Cannot move (immobile)
+        -- 4. Have build distance capability
+        if unitDef and 
+           unitDef.isBuilder and                    -- Can build/repair
+           unitDef.isStaticBuilder and              -- Static builder type
+           not unitDef.canMove and                  -- Cannot move (immobile)
+           unitDef.buildDistance and                -- Has build range
+           unitDef.buildDistance > 0 then           -- Valid build range
             
-            local name = unitDef.name or ""
-            local desc = unitDef.description or ""
+            turretDefIDs[unitDefID] = true
             
-            if string.find(name, "nano") or string.find(desc:lower(), "nano") or
-               string.find(desc:lower(), "construction turret") then
-                turretDefIDs[unitDefID] = true
+            -- Store turret capabilities for action filtering
+            turretCapabilities[unitDefID] = {
+                canRepair = unitDef.canRepair ~= false,      -- Default true for builders
+                canReclaim = unitDef.canReclaim ~= false,    -- Default true for builders
+                canResurrect = unitDef.canResurrect == true  -- Must be explicitly true
+            }
+            
+            if DEBUG_MODE then
+                local name = unitDef.name or "unknown"
+                local caps = turretCapabilities[unitDefID]
+                Spring.Echo("  Found nano turret: " .. name .. " (ID: " .. unitDefID .. 
+                           ") - Reclaim: " .. tostring(caps.canReclaim) .. 
+                           ", Resurrect: " .. tostring(caps.canResurrect))
             end
         end
     end
@@ -735,7 +887,7 @@ local function discoverConstructionTurrets()
     if DEBUG_MODE then
         local count = 0
         for _ in pairs(turretDefIDs) do count = count + 1 end
-        Spring.Echo("V4: Discovered " .. count .. " turret types")
+        Spring.Echo("Turret Manager: Discovered " .. count .. " nano turret types")
     end
 end
 
@@ -1374,6 +1526,17 @@ local function processSingleTurret(turretID, settings, currentFrame, forceProces
     local target = nil
     local cmdID = CMD.REPAIR
     
+    -- Check turret capabilities before processing modes
+    local defID = Spring.GetUnitDefID(turretID)
+    local caps = turretCapabilities[defID] or {canRepair = true, canReclaim = true, canResurrect = false}
+    
+    -- Skip modes the turret can't perform
+    if (settings.mode == PRIORITY_MODES.RECLAIM and not caps.canReclaim) or
+       (settings.mode == PRIORITY_MODES.RESURRECT and not caps.canResurrect) then
+        -- Fallback to BUILD mode if current mode not available
+        settings.mode = PRIORITY_MODES.BUILD
+    end
+    
     -- Priority-based action system with fallbacks
     if settings.mode == PRIORITY_MODES.OFF then
         -- OFF: No action priority, just find any construction work with tier/eco filters
@@ -1630,7 +1793,23 @@ for mode = 1, 4 do
         local turrets = filterTurrets(Spring.GetSelectedUnits())
         for _, turretID in ipairs(turrets) do
             local settings = getTurretSettings(turretID)
-            settings.mode = mode
+            
+            -- Check if turret can perform this mode
+            local defID = Spring.GetUnitDefID(turretID)
+            local caps = turretCapabilities[defID] or {canRepair = true, canReclaim = true, canResurrect = false}
+            
+            -- Only set mode if turret has the capability
+            if mode <= 2 or  -- BUILD and REPAIR always available
+               (mode == 3 and caps.canReclaim) or  -- RECLAIM if capable
+               (mode == 4 and caps.canResurrect) then  -- RESURRECT if capable
+                settings.mode = mode
+            else
+                -- Skip this mode for this turret
+                if DEBUG_MODE then
+                    Spring.Echo("  Turret " .. turretID .. " cannot perform " .. MODE_CONFIG[mode].name)
+                end
+            end
+            
             -- Force stop to trigger re-evaluation
             forceStopTurret(turretID)
         end
@@ -1773,12 +1952,23 @@ function widget:CommandsChanged()
     -- Update button states
     local cmds = widgetHandler.customCommands
     
-    -- Smart Mode button
-    CMD_SMART_MODE_DESC.params[1] = mixed and 0 or state.mode
+    -- Smart Mode button - build dynamic params based on capabilities
     if mixed then
+        CMD_SMART_MODE_DESC.params = {0, "Action Focus", "Build", "Repair", "Reclaim", "Resurrect"}
         CMD_SMART_MODE_DESC.tooltip = "Mixed modes - click to synchronize"
+        buttonModeMapping = {[0] = 0, [1] = 1, [2] = 2, [3] = 3, [4] = 4}  -- Default mapping
     else
-        CMD_SMART_MODE_DESC.tooltip = "Priority mode: OFF → Build → Repair → Reclaim → Resurrect"
+        -- Build params based on first turret's capabilities
+        if #turrets > 0 then
+            local params, modeToButton, buttonToMode = buildButtonParamsForTurret(turrets[1], state.mode)
+            CMD_SMART_MODE_DESC.params = params
+            CMD_SMART_MODE_DESC.tooltip = getModesTooltipForTurret(turrets[1])
+            buttonModeMapping = buttonToMode or {[0] = 0, [1] = 1, [2] = 2, [3] = 3, [4] = 4}
+        else
+            CMD_SMART_MODE_DESC.params = {0, "Action Focus", "Build", "Repair", "Reclaim", "Resurrect"}
+            CMD_SMART_MODE_DESC.tooltip = "Priority mode: OFF → Build → Repair → Reclaim → Resurrect"
+            buttonModeMapping = {[0] = 0, [1] = 1, [2] = 2, [3] = 3, [4] = 4}  -- Default mapping
+        end
     end
     
     -- ECO button
@@ -1815,16 +2005,53 @@ function widget:CommandNotify(cmdID, cmdParams, cmdOptions)
     if #turrets == 0 then return false end
     
     if cmdID == CMD_SMART_MODE then
-        -- Cycle mode for selected turrets
-        for _, turretID in ipairs(turrets) do
-            local settings = getTurretSettings(turretID)
-            settings.mode = (settings.mode + 1) % 5
-            -- Force stop to trigger re-evaluation
-            forceStopTurret(turretID)
+        -- Get the selected button index from cmdParams
+        local buttonIndex = cmdParams and cmdParams[1]
+        
+        if buttonIndex then
+            -- Direct button click - map button index to actual mode
+            local actualMode = buttonModeMapping[buttonIndex] or 0
+            
+            if DEBUG_MODE then
+                Spring.Echo("  Button clicked: index " .. buttonIndex .. " maps to mode " .. actualMode)
+            end
+            
+            for _, turretID in ipairs(turrets) do
+                local settings = getTurretSettings(turretID)
+                
+                -- Check if turret can perform this mode
+                local defID = Spring.GetUnitDefID(turretID)
+                local caps = turretCapabilities[defID] or {canRepair = true, canReclaim = true, canResurrect = false}
+                
+                -- Only set mode if turret has the capability
+                if actualMode <= 2 or  -- OFF, BUILD, REPAIR always available
+                   (actualMode == 3 and caps.canReclaim) or  -- RECLAIM if capable
+                   (actualMode == 4 and caps.canResurrect) then  -- RESURRECT if capable
+                    settings.mode = actualMode
+                else
+                    -- Fallback to BUILD if mode not available
+                    settings.mode = PRIORITY_MODES.BUILD
+                end
+                
+                -- Force stop to trigger re-evaluation
+                forceStopTurret(turretID)
+            end
+            
+            local newMode = getTurretSettings(turrets[1]).mode
+            Spring.Echo("Turret Manager: " .. MODE_CONFIG[newMode].display .. " for " .. #turrets .. " turret(s)")
+        else
+            -- Hotkey or other trigger - cycle to next available mode
+            for _, turretID in ipairs(turrets) do
+                local settings = getTurretSettings(turretID)
+                settings.mode = cycleToNextAvailableMode(turretID, settings.mode)
+                -- Force stop to trigger re-evaluation
+                forceStopTurret(turretID)
+            end
+            
+            local newMode = getTurretSettings(turrets[1]).mode
+            Spring.Echo("Turret Manager: " .. MODE_CONFIG[newMode].display .. " for " .. #turrets .. " turret(s)")
         end
         
-        local newMode = getTurretSettings(turrets[1]).mode
-        Spring.Echo("Turret Manager: " .. MODE_CONFIG[newMode].display .. " for " .. #turrets .. " turret(s)")
         processTurrets(turrets, true)  -- Force process on button click
         return true
         
@@ -1879,7 +2106,7 @@ function widget:UnitFinished(unitID, unitDefID, unitTeam)
     if unitTeam == Spring.GetMyTeamID() and turretDefIDs[unitDefID] then
         watchedTurrets[unitID] = true
         if DEBUG_MODE then
-            Spring.Echo("V4: New turret added: " .. unitID)
+            Spring.Echo("Turret Manager: New nano turret added: " .. unitID)
         end
     end
 end
@@ -1998,7 +2225,7 @@ end
 function widget:KeyPress(key, mods, isRepeat)
     if key == string.byte('D') and mods.ctrl and mods.shift then
         DEBUG_MODE = not DEBUG_MODE
-        Spring.Echo("V4: Debug mode " .. (DEBUG_MODE and "ON" or "OFF"))
+        Spring.Echo("Turret Manager: Debug mode " .. (DEBUG_MODE and "ON" or "OFF"))
         return true
     end
 end
